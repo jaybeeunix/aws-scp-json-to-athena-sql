@@ -127,6 +127,7 @@ such a table, `athena-ddl/` has the DDL as templates:
 | `05_validate.sql` | smoke tests — run these before trusting the generated queries |
 | `discover.sh` | read-only AWS calls that write the CSV for the two below |
 | `render_ddl.py` | fills the templates in from that CSV |
+| `run_sql.py` | runs a `.sql` file through Athena with the `aws` CLI |
 
 Either fill in the `<BUCKET>` / `<ORG_ID>` / `<ACCOUNT_ID>` placeholders by hand
 (each template lists its own in a `TEMPLATE-ONLY` block), or describe the trails
@@ -176,6 +177,36 @@ Pick the partitioning with `--partition-style`:
 An `eventtime` range predicate is always emitted as well, so the window is
 correct even if the partition style is wrong; only the bytes scanned suffer.
 
+## Running the SQL
+
+`StartQueryExecution` takes one statement, and these files hold several — `04`
+is a `CREATE` plus batched `ALTER`s, `05_validate_*` is five `SELECT`s, and each
+generated query file is a SUMMARY plus a DETAIL. `run_sql.py` splits a file
+(quote- and comment-aware, so a `;` in a string or comment does not end a
+statement), submits each in order, waits, and prints state, bytes scanned and
+the first rows:
+
+```
+cd athena-ddl
+./run_sql.py --work-group scp-impact rendered/prod-org/*.sql
+./run_sql.py --work-group scp-impact ../athena-queries/*.sql --save-results /tmp/out
+./run_sql.py --dry-run rendered/prod-org/04_cloudtrail_logs_ymd_manual.sql
+```
+
+It stops at the first failure (`--continue-on-error` to override), since later
+statements in a DDL file depend on the earlier ones. Either `--work-group` or
+`--output-location s3://…` is required — Athena needs somewhere to write. A
+workgroup is the better of the two because it can also cap the damage:
+
+```
+aws athena create-work-group --name scp-impact --configuration \
+  'ResultConfiguration={OutputLocation=s3://my-athena-results/scp/},EnforceWorkGroupConfiguration=true,BytesScannedCutoffPerQuery=10737418240'
+```
+
+To run one statement by hand, note the `=` in `--query-string=file://…`: these
+files open with a `--` comment line, and without it the CLI reads the value as
+an option.
+
 ## Options
 
 ```
@@ -198,11 +229,12 @@ correct even if the partition style is wrong; only the bytes scanned suffer.
 
 ```
 python3 -m unittest test_scp_to_athena
-cd athena-ddl && python3 -m unittest test_render_ddl
+cd athena-ddl && python3 -m unittest test_render_ddl test_run_sql
 ```
 
 48 tests covering glob translation, action/condition/resource mapping, NULL
 safety, comment escaping, and CLI scoping, plus 56 for the DDL renderer (CSV
 validation, variant selection, partition predicates and batching, placeholder
-exhaustion). If `sqlglot` is installed (`pip install sqlglot`) the generated SQL
+exhaustion) and 24 for the runner (statement splitting around quotes and
+comments). If `sqlglot` is installed (`pip install sqlglot`) the generated SQL
 is also parse-checked against the Athena dialect; those tests skip otherwise.
