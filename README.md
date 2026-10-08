@@ -116,7 +116,7 @@ results as candidates to review, not confirmed breakage.
 
 Assumes the standard AWS CloudTrail Athena schema (`useridentity` struct,
 `eventsource`, `eventname`, `resources` array, ...). If you do not already have
-such a table, `athena-ddl/` has the DDL:
+such a table, `athena-ddl/` has the DDL as templates:
 
 | File | |
 | --- | --- |
@@ -125,11 +125,44 @@ such a table, `athena-ddl/` has the DDL:
 | `03_cloudtrail_logs_org_projection.sql` | **organization trail** — the one to use for SCP analysis |
 | `04_cloudtrail_logs_ymd_manual.sql` | manual `year`/`month`/`day` partitions, for `--partition-style ymd` |
 | `05_validate.sql` | smoke tests — run these before trusting the generated queries |
+| `discover.sh` | read-only AWS calls that write the CSV for the two below |
+| `render_ddl.py` | fills the templates in from that CSV |
 
-Fill in the `<BUCKET>` / `<ORG_ID>` / account-list placeholders first. Partition
-projection needs no partition maintenance, but the account and region enums must
-list everything you want searched: a region missing from the enum returns no
-rows, which reads as "this SCP blocks nothing there."
+Either fill in the `<BUCKET>` / `<ORG_ID>` / `<ACCOUNT_ID>` placeholders by hand
+(each template lists its own in a `TEMPLATE-ONLY` block), or describe the trails
+in a CSV and render them:
+
+```
+cd athena-ddl
+./discover.sh --bucket-filter cloudtrail > trails.csv   # or --example-csv, and edit
+./render_ddl.py trails.csv                              # -> rendered/<name>/*.sql
+```
+
+`discover.sh` builds the CSV from the account itself — `cloudtrail list-trails`
+for the bucket/prefix/org flag, then the bucket layout for the org id, member
+accounts, regions and earliest delivered day, so those columns describe what was
+actually delivered rather than what is configured. It also picks up buckets whose
+trail lives in another account (the usual org/log-archive split), which
+`describe-trails` alone cannot see. Everything it finds that isn't a CSV column —
+delivery errors, whether data events are logged, SSE-KMS, lifecycle expiry — comes
+out as `#` comment lines that `render_ddl.py` skips. It is read-only; review the
+CSV before rendering.
+
+One CSV row per trail; each row produces every variant its columns support —
+`account_id` gets you the single-account table, `org_id` + `accounts` the org
+table, adding `region` the ymd table — plus a `05_validate_<variant>.sql` whose
+partition filters match that variant. The ymd variant's `ADD PARTITION`
+statements are generated for the whole window and batched. Each rendered file
+carries the `scp_to_athena.py` invocation that matches it, so the
+`--database`/`--table`/`--partition-style` triple cannot drift from the table it
+describes. `--only <variant>`, `--stdout` and `--force` are there too.
+
+Partition projection needs no partition maintenance, but the account and region
+enums must list everything you want searched: a region missing from the enum
+returns no rows, which reads as "this SCP blocks nothing there." The default
+enum is all 34 commercial regions (`./render_ddl.py --print-regions`); narrow it
+with the CSV's `regions` column once you know which ones the org uses, since
+Athena probes accounts × regions × days worth of prefixes.
 
 Pick the partitioning with `--partition-style`:
 
@@ -165,9 +198,11 @@ correct even if the partition style is wrong; only the bytes scanned suffer.
 
 ```
 python3 -m unittest test_scp_to_athena
+cd athena-ddl && python3 -m unittest test_render_ddl
 ```
 
 48 tests covering glob translation, action/condition/resource mapping, NULL
-safety, comment escaping, and CLI scoping. If `sqlglot` is installed
-(`pip install sqlglot`) the generated SQL is also parse-checked against the
-Athena dialect; those tests skip otherwise.
+safety, comment escaping, and CLI scoping, plus 56 for the DDL renderer (CSV
+validation, variant selection, partition predicates and batching, placeholder
+exhaustion). If `sqlglot` is installed (`pip install sqlglot`) the generated SQL
+is also parse-checked against the Athena dialect; those tests skip otherwise.

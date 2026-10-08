@@ -1,4 +1,7 @@
 .claude
 scps/*
 athena-queries/*
+athena-ddl/rendered/*
+athena-ddl/trails.csv
+__pycache__/
 
