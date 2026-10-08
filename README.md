@@ -115,8 +115,23 @@ results as candidates to review, not confirmed breakage.
 ## Table shape
 
 Assumes the standard AWS CloudTrail Athena schema (`useridentity` struct,
-`eventsource`, `eventname`, `resources` array, ...). Pick the partitioning with
-`--partition-style`:
+`eventsource`, `eventname`, `resources` array, ...). If you do not already have
+such a table, `athena-ddl/` has the DDL:
+
+| File | |
+| --- | --- |
+| `01_create_database.sql` | the `cloudtrail` Glue database |
+| `02_cloudtrail_logs_projection.sql` | single-account trail, all regions, partition projection |
+| `03_cloudtrail_logs_org_projection.sql` | **organization trail** — the one to use for SCP analysis |
+| `04_cloudtrail_logs_ymd_manual.sql` | manual `year`/`month`/`day` partitions, for `--partition-style ymd` |
+| `05_validate.sql` | smoke tests — run these before trusting the generated queries |
+
+Fill in the `<BUCKET>` / `<ORG_ID>` / account-list placeholders first. Partition
+projection needs no partition maintenance, but the account and region enums must
+list everything you want searched: a region missing from the enum returns no
+rows, which reads as "this SCP blocks nothing there."
+
+Pick the partitioning with `--partition-style`:
 
 | Value | Expects |
 | --- | --- |
