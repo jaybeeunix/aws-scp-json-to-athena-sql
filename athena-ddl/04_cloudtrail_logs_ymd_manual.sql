@@ -1,17 +1,25 @@
 -- =========================================================================================
--- cloudtrail.cloudtrail_logs_ymd -- manual year/month/day partitions
+-- <DATABASE>.<TABLE> -- manual year/month/day partitions
 --
 -- Use when you cannot use partition projection (e.g. the table is maintained by a Glue
 -- crawler, or you only want a few specific days registered).
 --
---     ./scp_to_athena.py ... --table cloudtrail_logs_ymd --partition-style ymd
+--     ./scp_to_athena.py ... --database <DATABASE> --table <TABLE> --partition-style ymd
+--
+-- TEMPLATE-ONLY BEGIN
+-- `<TOKENS>` are filled in by render_ddl.py from a CSV row. To fill them by hand:
+--     <BUCKET>       S3 bucket holding the trail
+--     <PREFIX>       key prefix above AWSLogs/, or delete that whole path segment
+--     <ACCOUNT_ID>   the account that owns the trail
+--     <REGION>       the ONE region this table covers
+-- plus one ADD PARTITION entry per day in the window, at the bottom of this file.
+-- TEMPLATE-ONLY END
 --
 -- Partitions are NOT auto-discovered: MSCK REPAIR TABLE does not work here because the
--- S3 path is not Hive-style (no `year=2025/`). Register each day explicitly -- see the
--- ALTER TABLE block at the bottom.
+-- S3 path is not Hive-style (no `year=2025/`). Every day must be registered explicitly.
 -- =========================================================================================
 
-CREATE EXTERNAL TABLE IF NOT EXISTS cloudtrail.cloudtrail_logs_ymd (
+CREATE EXTERNAL TABLE IF NOT EXISTS <DATABASE>.<TABLE> (
     eventversion       STRING,
     useridentity       STRUCT<
         type:          STRING,
@@ -74,20 +82,10 @@ STORED AS INPUTFORMAT 'com.amazon.emr.cloudtrail.CloudTrailInputFormat'
 OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
 LOCATION 's3://<BUCKET>/<PREFIX>/AWSLogs/<ACCOUNT_ID>/CloudTrail/<REGION>/';
 
--- One day, one region:
-ALTER TABLE cloudtrail.cloudtrail_logs_ymd ADD IF NOT EXISTS
-    PARTITION (year = '2025', month = '06', day = '01')
-    LOCATION 's3://<BUCKET>/<PREFIX>/AWSLogs/<ACCOUNT_ID>/CloudTrail/<REGION>/2025/06/01/';
+-- Register the days in the analysis window. Athena takes many PARTITION clauses per
+-- ALTER, so these are batched; run each statement separately in the console.
+<ADD_PARTITIONS>
 
--- A whole range is tedious by hand. Generate the statements instead:
---
---   d=2025-06-01; end=2025-09-09
---   while [[ "$d" < "$end" || "$d" == "$end" ]]; do
---     y=${d:0:4} m=${d:5:2} dd=${d:8:2}
---     echo "ALTER TABLE cloudtrail.cloudtrail_logs_ymd ADD IF NOT EXISTS PARTITION (year='$y', month='$m', day='$dd') LOCATION 's3://<BUCKET>/<PREFIX>/AWSLogs/<ACCOUNT_ID>/CloudTrail/<REGION>/$y/$m/$dd/';"
---     d=$(date -I -d "$d + 1 day")
---   done
---
 -- Note this table is pinned to ONE region by its LOCATION. For multi-region coverage
 -- either add a region partition key (and a region segment to each partition LOCATION),
 -- or prefer the projection tables in 02/03 -- which is why those are the default.

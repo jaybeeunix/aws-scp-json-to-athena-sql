@@ -1,0 +1,7 @@
+name,bucket,prefix,account_id,org_id,accounts,region,regions,start_date,end_date,database,table,styles
+# org trail: every member account, every commercial region, open-ended range
+prod-org,acme-cloudtrail-logs,,,o-abc1234567,111111111111 222222222222 333333333333,,,2025-06-01,,cloudtrail,cloudtrail_logs,
+# one account, trail under a prefix, only the regions this account is allowed in
+sandbox,acme-sandbox-trail,trails/sandbox,444444444444,,,us-east-1,us-east-1 us-west-2,2025-06-01,2025-09-09,cloudtrail,sandbox_logs,
+# same account again, manual partitions only -- single region by construction
+sandbox-ymd,acme-sandbox-trail,trails/sandbox,444444444444,,,us-east-1,,2025-09-01,2025-09-09,cloudtrail,sandbox_logs,ymd
