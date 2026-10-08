@@ -81,8 +81,10 @@ LOCATION 's3://<BUCKET>/<PREFIX>/AWSLogs/<ACCOUNT_ID>/CloudTrail/'
 TBLPROPERTIES (
     'projection.enabled'                 = 'true',
 
+    -- All 34 regions in the `aws` (commercial) partition. GovCloud is deliberately
+    -- excluded; it is a separate partition and never lands in a commercial trail bucket.
     'projection.region.type'             = 'enum',
-    'projection.region.values'           = 'us-east-1,us-east-2,us-west-1,us-west-2,ca-central-1,eu-west-1,eu-west-2,eu-west-3,eu-central-1,eu-north-1,eu-south-1,ap-south-1,ap-northeast-1,ap-northeast-2,ap-northeast-3,ap-southeast-1,ap-southeast-2,sa-east-1',
+    'projection.region.values'           = 'af-south-1,ap-east-1,ap-east-2,ap-northeast-1,ap-northeast-2,ap-northeast-3,ap-south-1,ap-south-2,ap-southeast-1,ap-southeast-2,ap-southeast-3,ap-southeast-4,ap-southeast-5,ap-southeast-6,ap-southeast-7,ca-central-1,ca-west-1,eu-central-1,eu-central-2,eu-north-1,eu-south-1,eu-south-2,eu-west-1,eu-west-2,eu-west-3,il-central-1,me-central-1,me-south-1,mx-central-1,sa-east-1,us-east-1,us-east-2,us-west-1,us-west-2',
 
     'projection.timestamp.type'          = 'date',
     'projection.timestamp.format'        = 'yyyy/MM/dd',
@@ -95,10 +97,16 @@ TBLPROPERTIES (
 
 -- Notes
 --   * `region` must be a partition key because projection templates cannot wildcard a
---     path segment. The generated queries only prune on `timestamp`, so Athena will probe
---     every region listed above for each day in range. Trim `projection.region.values`
---     to the regions the trail actually writes, or add `AND region IN (...)` by hand.
+--     path segment. The generated queries only prune on `timestamp`, so Athena probes all
+--     34 regions for each day in range. Trim `projection.region.values` to the regions
+--     the trail actually writes, or add `AND region IN (...)` by hand.
 --   * Keep every enabled region in the list, including ones the SCP is meant to deny --
---     those are exactly the rows this analysis is looking for.
+--     those are exactly the rows this analysis is looking for. A region missing from the
+--     enum returns no rows, which reads as "the SCP blocks nothing there."
+--   * Opt-in regions (af-south-1, ap-east-*, ap-southeast-3..7, eu-central-2, eu-south-*,
+--     il-central-1, me-*, mx-central-1, ca-west-1) only have a prefix once enabled, so
+--     listing them costs a wasted probe per day but never a wrong answer.
+--   * China (cn-north-1, cn-northwest-1) is left out for the same reason as GovCloud --
+--     separate partition, separate trail bucket. Swap the enum if this is an aws-cn org.
 --   * `projection.timestamp.range` bounds the scan. Starting it years before the trail
 --     exists costs listing time on every query.

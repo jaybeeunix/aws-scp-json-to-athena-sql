@@ -84,8 +84,10 @@ TBLPROPERTIES (
     'projection.account_id.type'         = 'enum',
     'projection.account_id.values'       = '111111111111,222222222222,333333333333',
 
+    -- All 34 regions in the `aws` (commercial) partition. GovCloud is deliberately
+    -- excluded; it is a separate partition and never lands in a commercial trail bucket.
     'projection.region.type'             = 'enum',
-    'projection.region.values'           = 'us-east-1,us-east-2,us-west-1,us-west-2,ca-central-1,eu-west-1,eu-west-2,eu-west-3,eu-central-1,eu-north-1,eu-south-1,ap-south-1,ap-northeast-1,ap-northeast-2,ap-northeast-3,ap-southeast-1,ap-southeast-2,sa-east-1',
+    'projection.region.values'           = 'af-south-1,ap-east-1,ap-east-2,ap-northeast-1,ap-northeast-2,ap-northeast-3,ap-south-1,ap-south-2,ap-southeast-1,ap-southeast-2,ap-southeast-3,ap-southeast-4,ap-southeast-5,ap-southeast-6,ap-southeast-7,ca-central-1,ca-west-1,eu-central-1,eu-central-2,eu-north-1,eu-south-1,eu-south-2,eu-west-1,eu-west-2,eu-west-3,il-central-1,me-central-1,me-south-1,mx-central-1,sa-east-1,us-east-1,us-east-2,us-west-1,us-west-2',
 
     'projection.timestamp.type'          = 'date',
     'projection.timestamp.format'        = 'yyyy/MM/dd',
@@ -98,8 +100,9 @@ TBLPROPERTIES (
 
 -- Notes
 --   * accounts x regions x days is the number of S3 prefixes Athena probes when nothing
---     but `timestamp` is filtered. 50 accounts x 18 regions x 100 days = 90k prefixes,
---     which is slow. Two ways to cut it down, both worth doing:
+--     but `timestamp` is filtered. With the full region enum that is 50 accounts x
+--     34 regions x 100 days = 170k prefixes, which is slow. Two ways to cut it down,
+--     both worth doing:
 --       - list only the accounts in scope for the SCP in `projection.account_id.values`
 --         (and the same set in `--accounts` so the row filter matches), and
 --       - trim `projection.region.values` to regions the org actually uses.
