@@ -747,6 +747,7 @@ DETAIL_COLUMNS = """\
     errorcode,
     errormessage,
     readonly,
+    eventcategory,
     eventid,
     resources,
     requestparameters"""

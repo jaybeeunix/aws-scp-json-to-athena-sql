@@ -37,6 +37,7 @@ SELECT eventversion,
        count(useridentity.arn)                              AS has_principal_arn,
        count(useridentity.sessioncontext.sessionissuer.arn) AS has_session_issuer,
        count(tlsdetails)                                    AS has_tls,
+       count(eventcategory)                                 AS has_event_category,
        count_if(cardinality(resources) > 0)                 AS has_resources
 FROM <DATABASE>.<TABLE>
 WHERE <SAMPLE_DAY_PREDICATE>
@@ -56,10 +57,13 @@ ORDER BY events DESC;
 -- 4. Management events only, or data events too?
 --    `Data` showing up means s3:GetObject-style denials are visible. If this is
 --    all `Management`, SCPs on data-plane actions will look harmless when they are not.
-SELECT eventtype, readonly, count(*) AS events
+--    eventcategory says so directly; eventtype is kept alongside it because
+--    eventcategory is NULL on the oldest eventversions (see query 2), and
+--    because eventtype is what the generator excludes AwsServiceEvent on.
+SELECT eventcategory, eventtype, readonly, count(*) AS events
 FROM <DATABASE>.<TABLE>
 WHERE <SAMPLE_DAY_PREDICATE>
-GROUP BY 1, 2
+GROUP BY 1, 2, 3
 ORDER BY events DESC;
 
 -- 5. Confirm the window the generator was given (<WINDOW_START> .. <WINDOW_END>) has

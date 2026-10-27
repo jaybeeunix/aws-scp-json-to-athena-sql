@@ -79,6 +79,12 @@ CREATE EXTERNAL TABLE IF NOT EXISTS <DATABASE>.<TABLE> (
     serviceeventdetails STRING,
     sharedeventid      STRING,
     vpcendpointid      STRING,
+    -- 'Management' | 'Data' | 'Insight' | 'NetworkActivity', direct from the
+    -- record rather than inferred from eventtype. Absent from the oldest
+    -- eventversions, so expect NULLs -- query 2 in 05_validate.sql counts it
+    -- per version. Unreadable under the old CloudTrailSerde; see the SerDe
+    -- note below.
+    eventcategory      STRING,
     -- Must be a STRUCT for the same reason as useridentity above: this SerDe
     -- reflects over a fixed Java class, and declaring an object column STRING
     -- fails at read time with ReflectionStructObjectInspector cannot be cast
