@@ -69,10 +69,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS <DATABASE>.<TABLE> (
     serviceeventdetails STRING,
     sharedeventid      STRING,
     vpcendpointid      STRING,
-    tlsdetails         STRUCT<
-        tlsversion:               STRING,
-        ciphersuite:              STRING,
-        clientprovidedhostheader: STRING>
+    tlsdetails         STRING
 )
 PARTITIONED BY (
     account_id  STRING,
