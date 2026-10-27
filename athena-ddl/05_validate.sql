@@ -18,16 +18,30 @@ FROM <DATABASE>.<TABLE>
 WHERE <SAMPLE_DAY_PREDICATE>
 LIMIT 10;
 
--- 2. Do the nested fields the generated queries depend on actually resolve?
---    has_session_issuer should be non-zero -- the generated SQL coalesces it with
---    useridentity.arn to match `aws:PrincipalArn` against role ARNs.
-SELECT count(*)                                             AS rows,
+-- 2. Do the nested fields the generated queries depend on actually resolve,
+--    in every eventversion present?
+--    A trail carries several eventversions at once -- they are per event type,
+--    not a format the whole trail migrates through, so 1.08 and 1.11 records
+--    arrive side by side indefinitely. The useridentity struct declares a
+--    subset of fields, which is fine because version bumps are additive, but
+--    it does mean a field can be populated in one version and absent in
+--    another. Breaking the counts out per version catches that; a single
+--    aggregate row would hide it.
+--
+--    has_session_issuer should be non-zero -- the generated SQL coalesces it
+--    with useridentity.arn to match `aws:PrincipalArn` against role ARNs.
+--    A version with rows but zero has_principal_arn is the thing to worry
+--    about: every principal-scoped condition silently misses those events.
+SELECT eventversion,
+       count(*)                                             AS rows,
        count(useridentity.arn)                              AS has_principal_arn,
        count(useridentity.sessioncontext.sessionissuer.arn) AS has_session_issuer,
        count(tlsdetails)                                    AS has_tls,
        count_if(cardinality(resources) > 0)                 AS has_resources
 FROM <DATABASE>.<TABLE>
-WHERE <SAMPLE_DAY_PREDICATE>;
+WHERE <SAMPLE_DAY_PREDICATE>
+GROUP BY 1
+ORDER BY 1;
 
 -- 3. Which accounts and regions are actually covered by the trail?
 --    If an account you care about is missing here, the SCP analysis will
