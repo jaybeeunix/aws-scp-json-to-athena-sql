@@ -1,7 +1,12 @@
-name,bucket,prefix,account_id,org_id,accounts,region,regions,start_date,end_date,database,table,styles
+name,bucket,prefix,account_id,org_id,accounts,region,regions,start_date,end_date,database,table,styles,compact_location,accounts_location
 # org trail: every member account, every commercial region, open-ended range
-prod-org,acme-cloudtrail-logs,,,o-abc1234567,111111111111 222222222222 333333333333,,,2025-06-01,,cloudtrail,cloudtrail_logs,
+prod-org,acme-cloudtrail-logs,,,o-abc1234567,111111111111 222222222222 333333333333,,,2025-06-01,,cloudtrail,cloudtrail_logs,,,
+# large org: the same trail, compacted. `accounts` still lists every member -- the
+# backfill needs the enum to read the source -- but the queries run against the
+# compacted table, which has no account partition at all. accounts_location is where
+# dump_org_accounts.sh's CSV was uploaded, and gives the summaries an OU column.
+big-org,acme-cloudtrail-logs,,,o-abc1234567,111111111111 222222222222 333333333333,,,2025-06-01,2025-09-09,cloudtrail,cloudtrail_logs,org compact,s3://acme-athena-staging/compact,s3://acme-athena-staging/lookups
 # one account, trail under a prefix, only the regions this account is allowed in
-sandbox,acme-sandbox-trail,trails/sandbox,444444444444,,,us-east-1,us-east-1 us-west-2,2025-06-01,2025-09-09,cloudtrail,sandbox_logs,
+sandbox,acme-sandbox-trail,trails/sandbox,444444444444,,,us-east-1,us-east-1 us-west-2,2025-06-01,2025-09-09,cloudtrail,sandbox_logs,,,
 # same account again, manual partitions only -- single region by construction
-sandbox-ymd,acme-sandbox-trail,trails/sandbox,444444444444,,,us-east-1,,2025-09-01,2025-09-09,cloudtrail,sandbox_logs,ymd
+sandbox-ymd,acme-sandbox-trail,trails/sandbox,444444444444,,,us-east-1,,2025-09-01,2025-09-09,cloudtrail,sandbox_logs,ymd,,

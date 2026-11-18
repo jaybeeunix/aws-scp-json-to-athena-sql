@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 import tempfile
 import unittest
 
@@ -311,10 +312,11 @@ class ReadCsv(unittest.TestCase):
         path = write_csv(rd.EXAMPLE_CSV)
         trails = rd.read_trails(path, TODAY)
         self.assertEqual([t.name for t in trails],
-                         ["prod-org", "sandbox", "sandbox-ymd"])
+                         ["prod-org", "big-org", "sandbox", "sandbox-ymd"])
         self.assertEqual(trails[0].variants(), ["org"])
-        self.assertEqual(trails[1].variants(), ["projection", "ymd"])
-        self.assertEqual(trails[2].variants(), ["ymd"])
+        self.assertEqual(trails[1].variants(), ["org", "compact"])
+        self.assertEqual(trails[2].variants(), ["projection", "ymd"])
+        self.assertEqual(trails[3].variants(), ["ymd"])
 
 
 class Cli(unittest.TestCase):
@@ -335,6 +337,174 @@ class Cli(unittest.TestCase):
 
 
 @unittest.skipIf(sqlglot is None, "sqlglot not installed")
+def compact_trail(**kwargs) -> rd.Trail:
+    row = {"org_id": "o-abc1234567", "accounts": "2" * 12,
+           "compact_location": "s3://staging/compact", "end_date": "2025-06-03"}
+    row.update(kwargs)
+    return trail(**row)
+
+
+class Compact(unittest.TestCase):
+    def test_needs_a_location_and_a_source(self):
+        self.assertEqual(trail(org_id="o-abc1234567",
+                               accounts="2" * 12).missing_for("compact"),
+                         ["compact_location"])
+        self.assertEqual(
+            trail(compact_location="s3://x-bucket/c").missing_for("compact"),
+            ["compact_source"])
+        self.assertEqual(compact_trail().missing_for("compact"), [])
+
+    def test_source_prefers_the_org_table(self):
+        self.assertEqual(compact_trail().compact_source, "org")
+        self.assertEqual(
+            trail(account_id="1" * 12,
+                  compact_location="s3://x-bucket/c").compact_source, "projection")
+
+    def test_s3_cell_is_split_into_bucket_and_prefix(self):
+        t = compact_trail(compact_location="s3://my-bucket/a/b/")
+        self.assertEqual((t.compact_bucket, t.compact_prefix), ("my-bucket", "a/b"))
+        t = compact_trail(compact_location="s3://my-bucket")
+        self.assertEqual((t.compact_bucket, t.compact_prefix), ("my-bucket", ""))
+
+    def test_bad_s3_cell_is_rejected(self):
+        with self.assertRaises(rd.CsvError):
+            compact_trail(compact_location="/not/an/s3/url")
+
+    def test_overlapping_location_warns(self):
+        warnings = compact_trail(bucket="b-bucket",
+                                 compact_location="s3://b-bucket/x").warnings()
+        self.assertTrue(any("overlaps the trail" in w for w in warnings), warnings)
+
+    def test_many_accounts_without_compaction_warns(self):
+        many = " ".join("%012d" % n for n in range(rd.ACCOUNTS_NEEDING_COMPACTION + 1))
+        warnings = trail(org_id="o-abc1234567", accounts=many).warnings()
+        self.assertTrue(any("compact_location" in w for w in warnings), warnings)
+        # ...and goes away once they have set one.
+        self.assertFalse(any("compact_location" in w for w in
+                             compact_trail(accounts=many).warnings()))
+
+    def test_compact_without_its_source_style_warns(self):
+        warnings = compact_trail(styles="compact").warnings()
+        self.assertTrue(any("reads from" in w for w in warnings), warnings)
+        self.assertFalse(any("reads from" in w for w in
+                             compact_trail(styles="org compact").warnings()))
+
+    def test_one_insert_per_day_pinned_to_one_partition(self):
+        sql = rd.backfill_sql("db.tgt", "db.src", "timestamp",
+                              dt.date(2025, 6, 1), dt.date(2025, 6, 3))
+        self.assertEqual(sql.count("INSERT INTO db.tgt"), 3)
+        for day in ("2025/06/01", "2025/06/02", "2025/06/03"):
+            self.assertIn("WHERE \"timestamp\" = '%s'" % day, sql)
+        for day in ("2025-06-01", "2025-06-02", "2025-06-03"):
+            self.assertIn("'%s' AS dt" % day, sql)
+
+    def test_backfill_select_matches_the_table_column_order(self):
+        """INSERT INTO binds by position. If 06's column list and COMPACT_COLUMNS
+        drift apart the data lands in the wrong columns without an error, so pin
+        the two together here rather than trusting the comment in each file."""
+        text = rd.load_template(rd.HERE, rd.VARIANTS["compact"][0])
+        body = text.split("CREATE EXTERNAL TABLE", 1)[1].split("PARTITIONED BY", 1)[0]
+        declared = []
+        depth = 0
+        for raw in body.split("\n"):
+            line = raw.strip()
+            if not line or line.startswith("--"):
+                continue
+            if depth == 0 and re.match(r"^[a-z_]+\s+(STRING|STRUCT|ARRAY)", line):
+                declared.append(line.split()[0])
+            depth += line.count("<") - line.count(">")
+        self.assertEqual(tuple(declared), rd.COMPACT_COLUMNS)
+
+    def test_predicates_use_the_dt_column(self):
+        self.assertEqual(rd.day_predicate("iso", dt.date(2025, 6, 1)),
+                         "dt = '2025-06-01'")
+        self.assertEqual(
+            rd.window_predicate("iso", dt.date(2025, 6, 1), dt.date(2025, 6, 3)),
+            "dt BETWEEN '2025-06-01' AND '2025-06-03'")
+
+    def test_reconcile_compares_each_table_in_its_own_partition_column(self):
+        files = dict(rd.render_trail(compact_trail(), rd.HERE, "d", ["compact"]))
+        sql = files[rd.BACKFILL_TEMPLATE]
+        self.assertIn("WHERE dt BETWEEN '2025-06-01' AND '2025-06-03'", sql)
+        self.assertIn("WHERE \"timestamp\" BETWEEN '2025/06/01' AND '2025/06/03'", sql)
+
+    def test_compacted_table_is_written_to_its_own_location(self):
+        files = dict(rd.render_trail(
+            compact_trail(bucket="trail-bucket",
+                          compact_location="s3://staging/compact"),
+            rd.HERE, "d", ["compact"]))
+        sql = files[rd.VARIANTS["compact"][0]]
+        self.assertIn("LOCATION 's3://staging/compact/cloudtrail_logs_compact/'", sql)
+        self.assertNotIn("trail-bucket", sql)
+
+    def test_backfill_rides_along_with_the_variant(self):
+        names = [n for n, _ in rd.render_trail(compact_trail(), rd.HERE, "d",
+                                               ["compact"])]
+        self.assertIn(rd.BACKFILL_TEMPLATE, names)
+        self.assertIn("05_validate_compact.sql", names)
+
+
+class OrgAccounts(unittest.TestCase):
+    def test_rendered_only_when_a_location_is_given(self):
+        names = [n for n, _ in rd.render_trail(trail(account_id="1" * 12),
+                                               rd.HERE, "d", None)]
+        self.assertNotIn(rd.ACCOUNTS_TEMPLATE, names)
+        names = [n for n, _ in rd.render_trail(
+            trail(account_id="1" * 12, accounts_location="s3://staging/lookups"),
+            rd.HERE, "d", None)]
+        self.assertIn(rd.ACCOUNTS_TEMPLATE, names)
+
+    def test_reads_its_own_prefix_not_the_trail_bucket(self):
+        files = dict(rd.render_trail(
+            trail(account_id="1" * 12, bucket="trail-bucket",
+                  accounts_location="s3://staging/lookups", accounts_table="accts"),
+            rd.HERE, "d", ["projection"]))
+        sql = files[rd.ACCOUNTS_TEMPLATE]
+        self.assertIn("LOCATION 's3://staging/lookups/org_accounts/'", sql)
+        self.assertIn("cloudtrail.accts", sql)
+        self.assertNotIn("trail-bucket", sql)
+
+    def test_suggested_command_passes_the_table_through(self):
+        lines = rd.suggested_command(
+            trail(account_id="1" * 12, accounts_location="s3://staging/lookups"),
+            "projection", "tbl")
+        self.assertTrue(any("--accounts-table cloudtrail.org_accounts" in line
+                            for line in lines), lines)
+
+
+class SuggestedCommand(unittest.TestCase):
+    def test_every_header_line_is_commented(self):
+        """wrap_accounts() returns one entry with embedded newlines. A continuation
+        that does not get the `--` prefix is raw SQL inside the header block, which
+        makes the whole rendered file unparseable."""
+        many = " ".join("%012d" % n for n in range(rd.MAX_SUGGESTED_ACCOUNTS))
+        text = rd.header(trail(org_id="o-abc1234567", accounts=many),
+                         "03.sql", "d", "org", "tbl")
+        for line in text.split("\n"):
+            if line.strip():
+                self.assertTrue(line.startswith("--"), line)
+
+    def test_small_account_list_is_spelled_out(self):
+        lines = rd.suggested_command(
+            trail(org_id="o-abc1234567", accounts="1" * 12 + " " + "2" * 12),
+            "org", "tbl")
+        self.assertTrue(any("--accounts 111111111111 222222222222" in line
+                            for line in lines), lines)
+
+    def test_large_account_list_is_replaced_by_advice(self):
+        many = " ".join("%012d" % n for n in range(rd.MAX_SUGGESTED_ACCOUNTS + 1))
+        lines = rd.suggested_command(
+            trail(org_id="o-abc1234567", accounts=many), "org", "tbl")
+        self.assertFalse(any(line.strip().startswith("--accounts ")
+                             for line in lines), lines)
+        self.assertTrue(any("accounts in scope" in line for line in lines), lines)
+        # The advice must not land between a `\` continuation and the next flag,
+        # or the suggested command stops being runnable when pasted.
+        continued = [i for i, line in enumerate(lines) if line.endswith("\\")]
+        for i in continued:
+            self.assertFalse(lines[i + 1].lstrip().startswith("#"), lines)
+
+
 class ParseCheck(unittest.TestCase):
     def test_rendered_sql_parses_as_athena(self):
         t = trail(account_id="1" * 12, org_id="o-abc1234567", accounts="2" * 12,
@@ -342,6 +512,16 @@ class ParseCheck(unittest.TestCase):
         for name, sql in rd.render_trail(t, rd.HERE, "d", None):
             with self.subTest(name=name):
                 sqlglot.parse(sql, read="athena")
+
+    def test_compact_sql_parses_as_athena(self):
+        for name, sql in rd.render_trail(compact_trail(), rd.HERE, "d", None):
+            with self.subTest(name=name):
+                sqlglot.parse(sql, read="athena")
+
+    def test_org_accounts_sql_parses_as_athena(self):
+        t = trail(account_id="1" * 12, accounts_location="s3://staging/lookups")
+        files = dict(rd.render_trail(t, rd.HERE, "d", ["projection"]))
+        sqlglot.parse(files[rd.ACCOUNTS_TEMPLATE], read="athena")
 
 
 if __name__ == "__main__":

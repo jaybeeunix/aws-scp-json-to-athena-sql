@@ -763,9 +763,14 @@ SUMMARY_COLUMNS = """\
     count(*)                                                  AS events,
     count_if(errorcode IS NULL)                               AS succeeded,
     count_if(errorcode IS NOT NULL)                           AS failed,
-    count(DISTINCT sourceipaddress)                           AS distinct_source_ips,
+    approx_distinct(sourceipaddress)                          AS approx_source_ips,
     min(eventtime)                                            AS first_seen,
     max(eventtime)                                            AS last_seen"""
+# approx_distinct, not count(DISTINCT): an exact distinct count needs every value
+# shuffled to one node per group, and the group here is already fine-grained
+# (account x principal x service x api x region). Across an organization that is a
+# lot of shuffle to decide whether a number is 7 or 8. The counts that carry weight
+# -- events, and accounts affected in the combined query -- stay exact.
 
 
 class QueryBuilder:
@@ -839,12 +844,24 @@ class QueryBuilder:
             return Pred(
                 "concat(\"year\", '/', lpad(\"month\", 2, '0'), '/', lpad(\"day\", 2, '0'))\n"
                 "    BETWEEN '%s' AND '%s'" % (start_slash, end_slash), note)
+        if a.partition_style == "iso":
+            # The compacted table (athena-ddl/06). A string column rather than a DATE,
+            # so this is a plain string comparison with no cast -- see that file.
+            col = quote_ident(a.partition_column or "dt")
+            return Pred("%s BETWEEN '%s' AND '%s'" % (col, a.start, a.end), note)
         return None
 
     # -- per statement ----------------------------------------------------
-    def statement_where(self, statement: dict, caveats: CaveatBag) -> str:
+    def statement_predicates(self, statement: dict,
+                             caveats: CaveatBag) -> List[Pred]:
+        """Just the Action / Resource / Condition conjuncts, without the scope.
+
+        Kept separate from scope_predicates() so the combined query can hoist the
+        scope into a single shared scan and test each statement's own predicate as
+        an expression over that scan, instead of re-reading the table per statement.
+        """
         translator = ActionTranslator(self.args.service_map)
-        preds = self.scope_predicates()
+        preds: List[Pred] = []
 
         if "Action" in statement:
             sql = translator.predicate(as_list(statement["Action"]), caveats)
@@ -863,8 +880,28 @@ class QueryBuilder:
             preds.append(Pred(sql, "NotResource element"))
 
         preds.extend(condition_predicate(statement.get("Condition") or {}, caveats))
+        return preds
 
-        return render_where(preds)
+    def statement_where(self, statement: dict, caveats: CaveatBag) -> str:
+        return render_where(self.scope_predicates()
+                            + self.statement_predicates(statement, caveats))
+
+    def statement_expr(self, statement: dict, caveats: CaveatBag,
+                       indent: str = " " * 12) -> str:
+        """The same statement predicates as one boolean expression, for the combined
+        query's `IF(<expr>, ...)`. Each conjunct is flattened onto its own line --
+        the multi-line layout render_where() produces is built for a WHERE clause and
+        does not survive being nested inside a function call."""
+        parts = [" ".join(pred.sql.split())
+                 for pred in self.statement_predicates(statement, caveats)
+                 if pred.sql and pred.sql.strip() != "TRUE"]
+        if not parts:
+            # No Action/Resource/Condition at all: a Deny that matches everything in
+            # scope. Rare, but a Quarantine SCP looks like this.
+            return "TRUE"
+        if len(parts) == 1:
+            return wrap(parts[0])
+        return ("(" + ("\n%sAND " % indent).join(wrap(p) for p in parts) + ")")
 
     def build(self, policy_name: str, sid: str, statement: dict,
               source_file: str) -> Tuple[str, CaveatBag]:
@@ -946,22 +983,181 @@ class QueryBuilder:
 
         return "\n\n".join(chunks) + "\n", caveats
 
-    def summary_select(self, policy_name: str, sid: str, statement: dict) -> Tuple[str, CaveatBag]:
-        """Bare SELECT for the combined UNION ALL file."""
+    def hit_arm(self, policy_name: str, sid: str,
+                statement: dict) -> Tuple[str, CaveatBag]:
+        """One arm of the combined query's hit array: a predicate, and the
+        (scp, sid) pair to tag a row with when it holds."""
         caveats = CaveatBag()
-        where = self.statement_where(statement, caveats)
-        sql = (
-            "SELECT\n"
-            "    %s AS scp,\n"
-            "    %s AS sid,\n"
+        pad = " " * 19  # lines up under the `filter(ARRAY[` in combined()
+        expr = self.statement_expr(statement, caveats, indent=pad + " " * 4)
+        arm = ("%sIF(%s,\n"
+               "%s   CAST(ROW(%s, %s) AS ROW(scp VARCHAR, sid VARCHAR)))"
+               % (pad, expr, pad, sql_literal(policy_name), sql_literal(sid)))
+        return arm, caveats
+
+    def combined(self, arms: Sequence[str]) -> str:
+        """Every Deny statement evaluated in ONE pass over the table.
+
+        The obvious shape for this is a UNION ALL of per-statement SELECTs, and that
+        is what this used to be. Trino does not share a table scan between UNION
+        branches, so it read the whole window once per statement -- with a dozen SCPs,
+        a dozen scans of the same bytes. Here the scan happens once and each
+        statement's predicate is an IF() over it; the array of whichever ones matched
+        is unnested, so a row that two SCPs would both block still contributes a row
+        to each. Same answer, 1/N the bytes.
+
+        With --hits-table the matched rows are materialised and the reports read that
+        instead, which takes the whole file down to a single scan of the trail.
+        Without it each report carries the scan as a CTE, so N reports are N scans --
+        still far better than one per statement, but not free.
+        """
+        joined = bool(self.args.accounts_table)
+        hits_table = self.args.hits_table
+
+        account_select = (
+            "        COALESCE(org.account_name, '')                       AS account_name,\n"
+            "        COALESCE(org.ou_path, '(not in the accounts table)') AS ou_path,\n"
+            if joined else "")
+        account_join = (
+            "\n    LEFT JOIN %s org ON org.account_id = recipientaccountid"
+            % self.args.accounts_table if joined else "")
+
+        # The shared scan. Produces one row per (event, matching Deny statement).
+        hit_rows = (
+            "    SELECT\n"
+            "        recipientaccountid                                   AS account_id,\n"
+            "%s"
+            "        awsregion                                            AS region,\n"
+            "        eventsource,\n"
+            "        eventname,\n"
+            "        eventtime,\n"
+            "        errorcode,\n"
+            "        COALESCE(useridentity.sessioncontext.sessionissuer.arn,\n"
+            "                 useridentity.arn,\n"
+            "                 useridentity.type)                          AS principal,\n"
+            "        hit.scp                                              AS scp,\n"
+            "        hit.sid                                              AS sid\n"
+            "    FROM (\n"
+            "        SELECT *,\n"
+            "               -- One arm per Deny statement. filter(..., IS NOT NULL)\n"
+            "               -- rather than array_remove(..., NULL): comparing to NULL\n"
+            "               -- is not how you drop NULLs.\n"
+            "               filter(ARRAY[\n"
             "%s\n"
-            "FROM %s\n"
-            "WHERE\n%s\n"
-            "GROUP BY 1, 2, 3, 4, 5, 6, 7"
-            % (sql_literal(policy_name), sql_literal(sid), SUMMARY_COLUMNS,
-               self.table, where)
+            "               ], hit -> hit.sid IS NOT NULL) AS hits\n"
+            "        FROM %s\n"
+            "        WHERE\n%s\n"
+            "    ) scanned%s\n"
+            "    CROSS JOIN UNNEST(hits) AS t (hit)"
+            % (account_select, ",\n".join(arms), self.table,
+               render_where(self.scope_predicates(), pad=" " * 12), account_join)
         )
-        return sql, caveats
+
+        if hits_table:
+            source = hits_table
+            prelude = (
+                "-- ---------------------------------------------------------------\n"
+                "-- 0. MATERIALISE -- the one and only scan of the trail.\n"
+                "-- Every report below reads this table instead of the trail, so the\n"
+                "-- whole file costs one pass over the window rather than one per\n"
+                "-- report. The result is small: matched events only, and none of the\n"
+                "-- wide columns.\n"
+                "--\n"
+                "-- CREATE TABLE AS refuses a non-empty location and DROP TABLE does\n"
+                "-- NOT clear it, so re-running this file means emptying the prefix\n"
+                "-- first:\n"
+                "--     aws s3 rm --recursive '%s/'\n"
+                "-- ---------------------------------------------------------------\n"
+                "DROP TABLE IF EXISTS %s;\n\n"
+                "CREATE TABLE %s\n"
+                "WITH (format = 'PARQUET', external_location = '%s/') AS\n"
+                "%s;\n\n"
+                % (self.args.hits_location.rstrip("/"), hits_table, hits_table,
+                   self.args.hits_location.rstrip("/"), hit_rows)
+            )
+            from_clause = "FROM %s" % source
+        else:
+            prelude = ""
+            from_clause = "FROM (\n%s\n)" % hit_rows
+
+        ou_count = ("       count(DISTINCT ou_path)                   AS ous_affected,\n"
+                    if joined else "")
+        blast = (
+            "-- ---------------------------------------------------------------\n"
+            "-- 1. BLAST RADIUS -- one row per Deny statement. Start here.\n"
+            "-- `accounts_affected` is the number that matters: an SCP hitting 3\n"
+            "-- accounts and one hitting 900 need very different conversations, and\n"
+            "-- per-event detail tells you neither. Account%s counts are exact;\n"
+            "-- principals/apis/regions are approx_distinct, accurate to a couple of\n"
+            "-- percent and without a shuffle per group.\n"
+            "-- ---------------------------------------------------------------\n"
+            "SELECT scp,\n"
+            "       sid,\n"
+            "       count(DISTINCT account_id)                AS accounts_affected,\n"
+            "%s"
+            "       count(*)                                  AS events,\n"
+            "       count_if(errorcode IS NULL)               AS succeeded,\n"
+            "       approx_distinct(principal)                AS principals,\n"
+            "       approx_distinct(eventname)                AS apis,\n"
+            "       approx_distinct(region)                   AS regions,\n"
+            "       min(eventtime)                            AS first_seen,\n"
+            "       max(eventtime)                            AS last_seen\n"
+            "%s\n"
+            "GROUP BY 1, 2\n"
+            "ORDER BY accounts_affected DESC, events DESC;"
+            % (" and OU" if joined else "", ou_count, from_clause)
+        )
+
+        reports = [blast]
+
+        if joined:
+            reports.append(
+                "-- ---------------------------------------------------------------\n"
+                "-- 2. BY OU -- the same thing aggregated the way SCPs are attached.\n"
+                "-- An SCP goes on an OU, not on an account, so this is the row that\n"
+                "-- decides whether attaching it is safe: an OU with no affected\n"
+                "-- accounts can take the policy today.\n"
+                "-- ---------------------------------------------------------------\n"
+                "SELECT scp,\n"
+                "       sid,\n"
+                "       ou_path,\n"
+                "       count(DISTINCT account_id)                AS accounts_affected,\n"
+                "       count(*)                                  AS events,\n"
+                "       count_if(errorcode IS NULL)               AS succeeded,\n"
+                "       max(eventtime)                            AS last_seen\n"
+                "%s\n"
+                "GROUP BY 1, 2, 3\n"
+                "ORDER BY scp, accounts_affected DESC\n"
+                "LIMIT %d;" % (from_clause, self.args.limit))
+
+        account_cols = ("       account_name,\n       ou_path,\n" if joined else "")
+        account_group = "1, 2, 3, 4, 5" if joined else "1, 2, 3"
+        reports.append(
+            "-- ---------------------------------------------------------------\n"
+            "-- %d. BY ACCOUNT -- the loudest accounts per statement.\n"
+            "-- Ordered by events and truncated at %d. With thousands of accounts\n"
+            "-- the tail is long, so read this as 'the worst offenders', not 'all of\n"
+            "-- them' -- report 1 has the real totals. To work through one statement\n"
+            "-- properly, open its own file in this directory.\n"
+            "-- ---------------------------------------------------------------\n"
+            "SELECT scp,\n"
+            "       sid,\n"
+            "       account_id,\n"
+            "%s"
+            "       count(*)                                  AS events,\n"
+            "       count_if(errorcode IS NULL)               AS succeeded,\n"
+            "       approx_distinct(principal)                AS principals,\n"
+            "       approx_distinct(eventname)                AS apis,\n"
+            "       min(eventtime)                            AS first_seen,\n"
+            "       max(eventtime)                            AS last_seen\n"
+            "%s\n"
+            "GROUP BY %s\n"
+            "ORDER BY events DESC\n"
+            "LIMIT %d;"
+            % (len(reports) + 1, self.args.limit, account_cols, from_clause,
+               account_group, self.args.limit))
+
+        return prelude + "\n\n".join(reports)
 
     def header(self, policy_name: str, sid: str, statement: dict,
                source_file: str, caveats: CaveatBag) -> str:
@@ -1040,12 +1236,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     tbl.add_argument("--database", default="default", help="Glue database (default: default)")
     tbl.add_argument("--table", default="cloudtrail_logs", help="CloudTrail table name")
     tbl.add_argument("--partition-style", default="timestamp",
-                     choices=["timestamp", "ymd", "date", "none"],
+                     choices=["timestamp", "ymd", "date", "iso", "none"],
                      help="how the table is partitioned: 'timestamp' string YYYY/MM/dd "
                           "(partition projection, the AWS console default), 'ymd' "
-                          "year/month/day columns, 'date' a DATE column, or 'none'")
+                          "year/month/day columns, 'date' a DATE column, 'iso' a string "
+                          "YYYY-MM-DD column named dt (the compacted table from "
+                          "athena-ddl/06), or 'none'")
     tbl.add_argument("--partition-column",
-                     help="override the partition column name for 'timestamp'/'date'")
+                     help="override the partition column name for "
+                          "'timestamp'/'date'/'iso'")
+    tbl.add_argument("--accounts-table", metavar="DB.TABLE",
+                     help="Glue table of account_id -> account_name, ou_path (see "
+                          "athena-ddl/08_org_accounts.sql). Adds an OU rollup to the "
+                          "combined query, which is how you read an impact report "
+                          "across more accounts than you can scroll through")
 
     scope = parser.add_argument_group("scope")
     scope.add_argument("--start", help="inclusive start date, YYYY-MM-DD")
@@ -1072,7 +1276,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     out.add_argument("--mode", default="both", choices=["both", "summary", "detail"])
     out.add_argument("--limit", type=int, default=500, help="LIMIT for generated queries")
     out.add_argument("--no-combined", action="store_true",
-                     help="skip the combined UNION ALL overview query")
+                     help="skip the combined overview query")
+    out.add_argument("--hits-table", metavar="DB.TABLE",
+                     help="materialise the combined query's matched events into this "
+                          "table first, so its reports read that instead of the trail. "
+                          "Takes the combined file from one scan per report to one "
+                          "scan total. Requires --hits-location")
+    out.add_argument("--hits-location", metavar="S3URI",
+                     help="s3:// prefix for --hits-table. Must be empty: CREATE TABLE "
+                          "AS refuses a non-empty location, and DROP TABLE does not "
+                          "clear it")
     out.add_argument("--service-map", help="JSON file of {iam_prefix: [eventsource, ...]} "
                                            "overrides, merged over the built-ins")
 
@@ -1095,6 +1308,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if bool(args.start) != bool(args.end):
         parser.error("--start and --end must be given together (or use --days)")
 
+    if bool(args.hits_table) != bool(args.hits_location):
+        parser.error("--hits-table and --hits-location must be given together")
+    if args.hits_location and not args.hits_location.startswith("s3://"):
+        parser.error("--hits-location must be an s3:// URI")
+    for flag in ("accounts_table", "hits_table"):
+        value = getattr(args, flag)
+        if value and not re.match(r"^[A-Za-z_][\w]*(\.[A-Za-z_][\w]*)?$", value):
+            parser.error("--%s must be `table` or `database.table`"
+                         % flag.replace("_", "-"))
+
     service_map = dict(SERVICE_EVENTSOURCE_OVERRIDES)
     if args.service_map:
         with open(args.service_map, "r", encoding="utf-8") as handle:
@@ -1115,7 +1338,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.stdout:
         os.makedirs(args.out_dir, exist_ok=True)
 
-    combined_selects: List[str] = []
+    combined_arms: List[str] = []
     all_caveats: List[Tuple[str, CaveatBag]] = []
     written = 0
     skipped: List[str] = []
@@ -1145,8 +1368,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             all_caveats.append(("%s / %s" % (policy_name, sid), caveats))
 
             if not args.no_combined:
-                select, _ = builder.summary_select(policy_name, sid, statement)
-                combined_selects.append(select)
+                arm, _ = builder.hit_arm(policy_name, sid, statement)
+                combined_arms.append(arm)
 
         if not blocks:
             print("note: %s has no Deny statements, nothing generated" % path,
@@ -1162,20 +1385,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 handle.write(body)
             written += 1
 
-    if combined_selects and not args.stdout and not args.no_combined:
-        combined = (
-            "-- " + "=" * 89 + "\n"
-            "-- COMBINED IMPACT OVERVIEW\n"
-            "-- One row per (scp, sid, account, principal, service, api, region) across\n"
-            "-- every Deny statement. Start here, then open the per-SCP file for detail.\n"
-            "-- Read the CAVEATS in each per-SCP file before acting on these numbers.\n"
-            "-- " + "=" * 89 + "\n\n"
-            + "\nUNION ALL\n".join(combined_selects)
-            + "\nORDER BY events DESC\nLIMIT %d;\n" % args.limit
-        )
+    if combined_arms and not args.stdout and not args.no_combined:
+        reports = 3 if args.accounts_table else 2
+        if args.hits_table:
+            cost = ("This file scans the trail once, into %s; the %d reports below "
+                    "read that." % (args.hits_table, reports))
+        else:
+            cost = ("This file holds %d reports, each carrying its own copy of that "
+                    "scan.\n-- Pass --hits-table/--hits-location to materialise it "
+                    "once instead." % reports)
+        bar = "-- " + "=" * 89
+        header = "\n".join([
+            bar,
+            "-- COMBINED IMPACT OVERVIEW -- %d Deny statement(s), one pass over the trail."
+            % len(combined_arms),
+            "-- Start here, then open the per-SCP file for whichever statement matters.",
+            "-- Read the CAVEATS in those files before acting on these numbers.",
+            "--",
+            "-- Every statement's predicate is evaluated against a single scan and the",
+            "-- matches tagged with the SCPs they hit, rather than UNION ALL-ing one",
+            "-- SELECT per statement: Trino does not share a scan across UNION branches,",
+            "-- so that shape cost %d reads of the same bytes." % len(combined_arms),
+            "-- " + cost,
+            bar,
+            "",
+            "",
+        ])
         dest = os.path.join(args.out_dir, "00_combined_impact.sql")
         with open(dest, "w", encoding="utf-8") as handle:
-            handle.write(combined)
+            handle.write(header + builder.combined(combined_arms) + "\n")
         written += 1
 
     if not args.stdout:
