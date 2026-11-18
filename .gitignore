@@ -2,6 +2,7 @@
 scps/*
 athena-queries/*
 athena-ddl/rendered/*
-athena-ddl/trails.csv
+athena-ddl/trails.csv*
+athena-ddl/org_accounts.csv*
 __pycache__/
 

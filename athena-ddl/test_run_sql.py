@@ -139,5 +139,80 @@ class Humanize(unittest.TestCase):
         self.assertEqual(rs.human_bytes(5 * 1024 ** 3), "5.0 GB")
 
 
+class ParallelBlocks(unittest.TestCase):
+    @staticmethod
+    def plan(statements, jobs):
+        return [("par" if concurrent else "ser", len(indices))
+                for concurrent, indices in rs.parallel_blocks(statements, jobs)]
+
+    def test_jobs_one_keeps_everything_serial(self):
+        self.assertEqual(self.plan(["INSERT INTO t VALUES (1)"] * 3, 1),
+                         [("ser", 1)] * 3)
+
+    def test_consecutive_inserts_share_a_block(self):
+        self.assertEqual(self.plan(["INSERT INTO t VALUES (1)"] * 4, 8),
+                         [("par", 4)])
+
+    def test_a_trailing_select_waits_for_the_inserts(self):
+        """The backfill's reconcile counts what the INSERTs wrote. Both keywords
+        are parallel-safe on their own, so grouping by safety alone would run it
+        against a half-written table."""
+        statements = ["INSERT INTO t VALUES (1)"] * 3 + ["SELECT count(*) FROM t"]
+        self.assertEqual(self.plan(statements, 8), [("par", 3), ("ser", 1)])
+
+    def test_ddl_is_a_barrier(self):
+        statements = ["CREATE TABLE t (a int)",
+                      "INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (2)",
+                      "ALTER TABLE t ADD COLUMN b int",
+                      "INSERT INTO t VALUES (3)"]
+        self.assertEqual(self.plan(statements, 8),
+                         [("ser", 1), ("par", 2), ("ser", 1), ("ser", 1)])
+
+    def test_every_statement_runs_exactly_once_in_order(self):
+        statements = ["CREATE TABLE t (a int)"] + \
+                     ["INSERT INTO t VALUES (%d)" % n for n in range(5)] + \
+                     ["SELECT 1", "SELECT 2"]
+        for jobs in (1, 2, 8):
+            flat = [i for _, indices in rs.parallel_blocks(statements, jobs)
+                    for i in indices]
+            self.assertEqual(flat, list(range(len(statements))), jobs)
+
+    def test_lone_safe_statement_is_not_labelled_parallel(self):
+        self.assertEqual(self.plan(["SELECT 1"], 8), [("ser", 1)])
+
+    def test_comment_prefixed_statements_classify_on_the_sql(self):
+        # Every generated file opens with a `--` banner; first_keyword has to see
+        # past it or nothing would ever be parallelised.
+        statements = ["-- banner\nINSERT INTO t VALUES (1)",
+                      "-- banner\nINSERT INTO t VALUES (2)"]
+        self.assertEqual(self.plan(statements, 4), [("par", 2)])
+
+
+class FormatTable(unittest.TestCase):
+    def test_returns_a_string_rather_than_printing(self):
+        # With --jobs the caller prints a whole statement report at once; anything
+        # that printed directly would interleave with the other workers.
+        out = rs.format_table([["a", "b"], ["1", "2"]], 10)
+        self.assertIsInstance(out, str)
+        self.assertIn("a", out)
+        self.assertIn("-+-", out)
+
+    def test_no_rows(self):
+        self.assertEqual(rs.format_table([], 10).strip(), "(no rows)")
+
+
+class JobsCli(unittest.TestCase):
+    def test_zero_jobs_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                rs.main(["--dry-run", "--jobs", "0", "x.sql"])
+
+    def test_default_is_serial(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    rs.main([])
+
+
 if __name__ == "__main__":
     unittest.main()

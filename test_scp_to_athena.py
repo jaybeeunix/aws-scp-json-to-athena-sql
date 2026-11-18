@@ -383,6 +383,146 @@ class PolicyHandling(unittest.TestCase):
             self.assertIn("widget-api.amazonaws.com", where)
 
 
+DENY_ROOT = {"Sid": "Root", "Effect": "Deny", "Action": "*", "Resource": "*",
+             "Condition": {"StringLike": {"aws:PrincipalArn": "arn:aws:iam::*:root"}}}
+DENY_IGW = {"Sid": "Igw", "Effect": "Deny",
+            "Action": ["ec2:CreateInternetGateway"], "Resource": "*"}
+
+
+def combined_sql(statements=(DENY_ROOT, DENY_IGW), **overrides):
+    argv = ["dummy.json", "--database", "ct", "--table", "logs",
+            "--start", "2025-01-01", "--end", "2025-01-31"]
+    for key, value in overrides.items():
+        argv.append("--" + key.replace("_", "-"))
+        if value is not True:
+            argv.extend(value if isinstance(value, list) else [str(value)])
+    args = s2a.parse_args(argv)
+    builder = s2a.QueryBuilder(args)
+    arms = [builder.hit_arm("Scp%d" % n, stmt["Sid"], stmt)[0]
+            for n, stmt in enumerate(statements)]
+    return builder.combined(arms)
+
+
+class CombinedIsOneScan(unittest.TestCase):
+    def test_table_is_read_once_per_report_not_once_per_statement(self):
+        """The UNION ALL shape this replaced read the table once per Deny
+        statement. With a dozen SCPs that was a dozen scans of the same bytes."""
+        sql = combined_sql([DENY_ROOT, DENY_IGW, DENY_IGW, DENY_ROOT])
+        reports = 2
+        self.assertEqual(sql.count("FROM ct.logs"), reports)
+        # Four statements, one IF() arm each, within each report's shared scan.
+        self.assertEqual(sql.count("IF("), 4 * reports)
+
+    def test_hits_table_takes_it_to_a_single_scan(self):
+        sql = combined_sql(hits_table="ct.hits", hits_location="s3://b/h")
+        self.assertEqual(sql.count("FROM ct.logs"), 1)
+        self.assertEqual(sql.count("FROM ct.hits"), 2)
+        self.assertIn("DROP TABLE IF EXISTS ct.hits;", sql)
+        self.assertIn("external_location = 's3://b/h/'", sql)
+        # Re-running needs the prefix emptied by hand; say so in the file.
+        self.assertIn("aws s3 rm --recursive 's3://b/h/'", sql)
+
+    def test_no_union_all_remains(self):
+        self.assertNotIn("UNION ALL", combined_sql())
+
+    def test_each_arm_carries_its_own_scp_and_sid(self):
+        sql = combined_sql()
+        self.assertIn("ROW('Scp0', 'Root')", sql)
+        self.assertIn("ROW('Scp1', 'Igw')", sql)
+
+    def test_scope_is_hoisted_out_of_the_arms(self):
+        """The window and the service-principal exclusions are the same for every
+        statement, so they belong in the shared WHERE, not repeated per arm."""
+        sql = combined_sql()
+        self.assertEqual(sql.count("aws-service-role"), 2)  # once per report's scan
+        self.assertNotIn("aws-service-role", sql.split("filter(ARRAY[")[1]
+                         .split("], hit ->")[0])
+
+    def test_nulls_are_dropped_with_filter_not_array_remove(self):
+        # array_remove(x, NULL) compares against NULL, which is not how you drop
+        # NULLs; filter with an explicit IS NOT NULL is.
+        sql = combined_sql()
+        self.assertIn("hit -> hit.sid IS NOT NULL", sql)
+        code = "\n".join(line for line in sql.split("\n")
+                         if not line.lstrip().startswith("--"))
+        self.assertNotIn("array_remove", code)
+
+    def test_accounts_affected_is_exact_and_the_rest_approximate(self):
+        sql = combined_sql()
+        self.assertIn("count(DISTINCT account_id)                AS accounts_affected",
+                      sql)
+        self.assertIn("approx_distinct(principal)", sql)
+
+    def test_accounts_table_adds_an_ou_report(self):
+        sql = combined_sql(accounts_table="ct.org_accounts")
+        self.assertIn("LEFT JOIN ct.org_accounts org ON org.account_id "
+                      "= recipientaccountid", sql)
+        self.assertIn("BY OU", sql)
+        self.assertIn("count(DISTINCT ou_path)", sql)
+        self.assertEqual(sql.count("FROM ct.logs"), 3)  # three reports now
+
+    def test_no_ou_report_without_the_table(self):
+        sql = combined_sql()
+        self.assertNotIn("ou_path", sql)
+        self.assertNotIn("BY OU", sql)
+
+    def test_statement_with_no_predicates_matches_everything_in_scope(self):
+        """A Quarantine SCP can be a bare Deny with no Action/Resource/Condition
+        the generator can narrow. TRUE is right; an empty expression is a syntax
+        error."""
+        builder = s2a.QueryBuilder(s2a.parse_args(
+            ["d.json", "--database", "ct", "--table", "logs"]))
+        self.assertEqual(
+            builder.statement_expr({"Effect": "Deny"}, s2a.CaveatBag()), "TRUE")
+
+    def test_arms_are_single_line_per_conjunct(self):
+        """statement_expr flattens each conjunct: render_where's layout is built
+        for a WHERE clause and does not survive nesting inside IF()."""
+        builder = s2a.QueryBuilder(s2a.parse_args(
+            ["d.json", "--database", "ct", "--table", "logs"]))
+        expr = builder.statement_expr(
+            {"Effect": "Deny", "Action": ["s3:*"],
+             "Condition": {"StringNotEquals": {"aws:RequestedRegion": "us-east-1"}}},
+            s2a.CaveatBag())
+        self.assertEqual(len([l for l in expr.split("\n") if l.strip()]), 2)
+        for line in expr.split("\n"):
+            self.assertNotIn("--", line)  # no comments inside an expression
+
+
+class IsoPartitionStyle(unittest.TestCase):
+    def test_iso_is_a_plain_string_between_on_dt(self):
+        where, _ = build({"Effect": "Deny", "Action": ["s3:*"], "Resource": "*"},
+                         partition_style="iso")
+        self.assertIn("dt BETWEEN '2025-01-01' AND '2025-01-31'", where)
+        # Not a DATE literal: the compacted table's dt is a STRING column, so a
+        # cast would be wrong as well as unnecessary.
+        self.assertNotIn("DATE '2025-01-01'", where)
+
+    def test_iso_column_can_be_renamed(self):
+        where, _ = build({"Effect": "Deny", "Action": ["s3:*"], "Resource": "*"},
+                         partition_style="iso", partition_column="day")
+        # quoted, because `day` is a reserved word
+        self.assertIn('"day" BETWEEN \'2025-01-01\'', where)
+
+
+class NewFlagValidation(unittest.TestCase):
+    def test_hits_table_and_location_come_as_a_pair(self):
+        for argv in (["--hits-table", "ct.hits"],
+                     ["--hits-location", "s3://b/h"]):
+            with self.assertRaises(SystemExit):
+                s2a.parse_args(["d.json"] + argv)
+
+    def test_hits_location_must_be_s3(self):
+        with self.assertRaises(SystemExit):
+            s2a.parse_args(["d.json", "--hits-table", "ct.h",
+                            "--hits-location", "/tmp/h"])
+
+    def test_table_names_are_identifiers(self):
+        for bad in ("ct.h; DROP TABLE x", "ct.h.extra", "1bad"):
+            with self.assertRaises(SystemExit):
+                s2a.parse_args(["d.json", "--accounts-table", bad])
+
+
 @unittest.skipIf(sqlglot is None, "sqlglot not installed")
 class SqlIsParseable(unittest.TestCase):
     CASES = [

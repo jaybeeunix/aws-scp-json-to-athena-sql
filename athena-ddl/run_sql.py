@@ -14,10 +14,19 @@ Usage
 -----
   ./run_sql.py --work-group scp-impact rendered/prod-org/*.sql
   ./run_sql.py --output-location s3://my-results/ ../athena-queries/*.sql
+  ./run_sql.py --work-group scp-impact --jobs 8 rendered/big-org/07_compact_backfill.sql
   ./run_sql.py --dry-run rendered/prod-org/04_cloudtrail_logs_ymd_manual.sql
 
 Stops at the first failed statement unless --continue-on-error: in a DDL file
 the later statements usually depend on the earlier ones.
+
+--jobs N runs independent statements concurrently. A compaction backfill is a
+hundred-odd INSERTs that do not depend on each other and take minutes each, so
+serially it is an afternoon. Only runs of consecutive SELECT/WITH/INSERT
+statements are parallelised; anything else -- CREATE, ALTER, DROP -- is a
+barrier that runs alone, in order, because the statements after it usually
+depend on it. So a file of 101 INSERTs followed by a reconciling SELECT still
+runs the SELECT last, and a CREATE-then-ALTER DDL file is unaffected by --jobs.
 
 Python 3.8+, standard library only. Shells out to `aws`, so it uses whatever
 credentials, profile and region the CLI is already configured with.
@@ -31,11 +40,16 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Sequence, Tuple
 
 TERMINAL = ("SUCCEEDED", "FAILED", "CANCELLED")
 # Statements whose results are worth printing rather than just acknowledging.
 ROW_PRODUCING = ("select", "with", "show", "describe", "desc", "explain", "values")
+# Statements safe to run alongside each other. Reads are trivially safe; INSERT is
+# here because the backfill's are disjoint by construction -- one per partition --
+# and that is the case --jobs exists for. Everything else is treated as a barrier.
+PARALLEL_SAFE = ("select", "with", "insert")
 
 
 # ---------------------------------------------------------------------------
@@ -237,23 +251,26 @@ class Athena:
 # output
 # ---------------------------------------------------------------------------
 
-def print_table(rows: List[List[str]], limit: int) -> None:
+def format_table(rows: List[List[str]], limit: int) -> str:
+    """Rendered as a string, not printed: with --jobs the caller prints whole
+    statement reports atomically so concurrent ones do not interleave."""
     if not rows:
-        print("      (no rows)")
-        return
+        return "      (no rows)"
     shown = rows[:limit + 1]
     widths: Dict[int, int] = {}
     for row in shown:
         for i, cell in enumerate(row):
             widths[i] = min(max(widths.get(i, 0), len(cell)), 40)
+    out: List[str] = []
     for n, row in enumerate(shown):
         cells = [cell[:40].ljust(widths.get(i, 0)) for i, cell in enumerate(row)]
-        print("      " + " | ".join(cells).rstrip())
+        out.append("      " + " | ".join(cells).rstrip())
         if n == 0:
-            print("      " + "-+-".join("-" * widths.get(i, 0)
-                                        for i in range(len(row))))
+            out.append("      " + "-+-".join("-" * widths.get(i, 0)
+                                             for i in range(len(row))))
     if len(rows) > limit + 1:
-        print("      ... (more rows in the result file)")
+        out.append("      ... (more rows in the result file)")
+    return "\n".join(out)
 
 
 def human_bytes(n: int) -> str:
@@ -267,6 +284,79 @@ def human_bytes(n: int) -> str:
 
 # ---------------------------------------------------------------------------
 
+def parallel_blocks(statements: Sequence[str],
+                    jobs: int) -> List[Tuple[bool, List[int]]]:
+    """Group statement indices into [(run_in_parallel, [index, ...]), ...].
+
+    A block is a run of consecutive statements with the SAME PARALLEL_SAFE keyword.
+    Anything else -- a different keyword, or one not in PARALLEL_SAFE -- starts a new
+    block, and blocks always run in order.
+
+    Same-keyword, not just same-safety, because the mix is where the hazard is. The
+    backfill is 101 INSERTs followed by a SELECT that counts what they wrote; both
+    keywords are individually safe to parallelise, but running the SELECT alongside
+    the INSERTs would have it count a half-written table. Grouping by keyword puts
+    the INSERTs in one concurrent block and the SELECT in the next, after them.
+    """
+    blocks: List[Tuple[str, List[int]]] = []
+    for index, statement in enumerate(statements):
+        keyword = first_keyword(statement)
+        safe = jobs > 1 and keyword in PARALLEL_SAFE
+        if safe and blocks and blocks[-1][0] == keyword:
+            blocks[-1][1].append(index)
+        else:
+            blocks.append((keyword if safe else "", [index]))
+    # A "parallel" block of one is just a serial statement; label it so.
+    return [(bool(keyword) and len(items) > 1, items) for keyword, items in blocks]
+
+
+def run_statement(athena: Athena, path: str, statement: str, number: int,
+                  total: int, args: argparse.Namespace) -> Tuple[bool, str]:
+    """Submit one statement and wait. Returns (succeeded, text to print).
+
+    Output is buffered rather than printed, so that concurrent statements each
+    land as one readable block instead of interleaving line by line.
+    """
+    out = ["  [%d/%d] %s" % (number, total, summarize(statement))]
+    try:
+        qid = athena.start(statement)
+        execution = athena.wait(qid, args.timeout)
+    except AwsError as exc:
+        out.append("        ERROR %s" % exc)
+        return False, "\n".join(out)
+
+    status = execution["Status"]
+    stats = execution.get("Statistics", {})
+    scanned = stats.get("DataScannedInBytes", 0)
+    millis = stats.get("EngineExecutionTimeInMillis", 0)
+    state = status["State"]
+    out.append("        %s in %.1fs, %s scanned  [%s]"
+               % (state, millis / 1000.0, human_bytes(scanned), qid))
+
+    if state != "SUCCEEDED":
+        out.append("        %s" % status.get("StateChangeReason", "(no reason given)"))
+        return False, "\n".join(out)
+
+    if args.max_results and returns_rows(statement):
+        try:
+            out.append(format_table(athena.results(qid, args.max_results),
+                                    args.max_results))
+        except AwsError as exc:
+            out.append("        (results unavailable: %s)" % exc)
+    if args.save_results:
+        location = execution.get("ResultConfiguration", {}).get("OutputLocation")
+        if location:
+            os.makedirs(args.save_results, exist_ok=True)
+            dest = os.path.join(
+                args.save_results,
+                "%s_%02d_%s.csv" % (os.path.basename(path).rsplit(".", 1)[0],
+                                    number, qid))
+            subprocess.run(athena.base + ["s3", "cp", location, dest],
+                           stdout=subprocess.DEVNULL)
+            out.append("        saved %s" % dest)
+    return True, "\n".join(out)
+
+
 def run_file(athena: Athena, path: str, args: argparse.Namespace) -> Tuple[int, int]:
     try:
         with open(path, encoding="utf-8") as fh:
@@ -275,57 +365,51 @@ def run_file(athena: Athena, path: str, args: argparse.Namespace) -> Tuple[int, 
         print("cannot read %s: %s" % (path, exc), file=sys.stderr)
         return (0, 1)
 
-    print("\n== %s -- %d statement(s)" % (path, len(statements)))
+    total = len(statements)
+    print("\n== %s -- %d statement(s)" % (path, total))
+
+    if args.dry_run:
+        for number, statement in enumerate(statements, 1):
+            print("  [%d/%d] %s" % (number, total, summarize(statement)))
+        return (0, 0)
+
     ok = failed = 0
-    for n, statement in enumerate(statements, 1):
-        label = "  [%d/%d] %s" % (n, len(statements), summarize(statement))
-        if args.dry_run:
-            print(label)
-            continue
-        print(label, flush=True)
-        try:
-            qid = athena.start(statement)
-            execution = athena.wait(qid, args.timeout)
-        except AwsError as exc:
-            print("        ERROR %s" % exc)
-            failed += 1
-            if not args.continue_on_error:
+    for concurrent, indices in parallel_blocks(statements, args.jobs):
+        if not concurrent:
+            index = indices[0]
+            succeeded, text = run_statement(athena, path, statements[index],
+                                            index + 1, total, args)
+            print(text, flush=True)
+            ok, failed = (ok + 1, failed) if succeeded else (ok, failed + 1)
+            if not succeeded and not args.continue_on_error:
                 return (ok, failed)
             continue
 
-        status = execution["Status"]
-        stats = execution.get("Statistics", {})
-        scanned = stats.get("DataScannedInBytes", 0)
-        millis = stats.get("EngineExecutionTimeInMillis", 0)
-        state = status["State"]
-        print("        %s in %.1fs, %s scanned  [%s]"
-              % (state, millis / 1000.0, human_bytes(scanned), qid))
-
-        if state != "SUCCEEDED":
-            reason = status.get("StateChangeReason", "(no reason given)")
-            print("        %s" % reason)
-            failed += 1
+        width = min(args.jobs, len(indices))
+        print("  -- %d statements, %d at a time" % (len(indices), width), flush=True)
+        # Let every statement in the block finish before deciding whether to stop.
+        # Cancelling in flight would leave an INSERT's partial output behind without
+        # telling you which partition to clean up; a full report does tell you.
+        with ThreadPoolExecutor(max_workers=width) as pool:
+            results = list(pool.map(
+                lambda index: run_statement(athena, path, statements[index],
+                                            index + 1, total, args),
+                indices))
+        block_failed = 0
+        for succeeded, text in results:
+            print(text, flush=True)
+            if succeeded:
+                ok += 1
+            else:
+                failed += 1
+                block_failed += 1
+        if block_failed:
+            print("  -- %d of %d statements in this block failed; re-run only those,"
+                  % (block_failed, len(indices)))
+            print("  -- and for INSERTs delete the target partition first (appends "
+                  "are not idempotent)")
             if not args.continue_on_error:
                 return (ok, failed)
-            continue
-
-        ok += 1
-        if args.max_results and returns_rows(statement):
-            try:
-                print_table(athena.results(qid, args.max_results), args.max_results)
-            except AwsError as exc:
-                print("        (results unavailable: %s)" % exc)
-        if args.save_results:
-            location = execution.get("ResultConfiguration", {}).get("OutputLocation")
-            if location:
-                os.makedirs(args.save_results, exist_ok=True)
-                dest = os.path.join(
-                    args.save_results,
-                    "%s_%02d_%s.csv" % (os.path.basename(path).rsplit(".", 1)[0],
-                                        n, qid))
-                subprocess.run(athena.base + ["s3", "cp", location, dest],
-                               stdout=subprocess.DEVNULL)
-                print("        saved %s" % dest)
     return (ok, failed)
 
 
@@ -348,11 +432,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="rows to print per query, 0 to skip (default: %(default)s)")
     parser.add_argument("--save-results", metavar="DIR",
                         help="also download each result CSV into DIR")
+    parser.add_argument("--jobs", type=int, default=1, metavar="N",
+                        help="run up to N independent statements at once (default: "
+                             "%(default)s). Only consecutive SELECT/WITH/INSERT "
+                             "statements are parallelised; DDL stays serial. Athena's "
+                             "default DML concurrency quota is 20-25, so leave "
+                             "headroom -- 8 is a good value for a backfill")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true",
                         help="list the statements without running them")
     args = parser.parse_args(argv)
 
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
     if not args.dry_run and not (args.work_group or args.output_location):
         parser.error("pass --work-group or --output-location: Athena has nowhere "
                      "to write results otherwise")
