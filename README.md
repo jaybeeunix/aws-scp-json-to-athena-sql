@@ -269,6 +269,23 @@ delivery errors, whether data events are logged, SSE-KMS, lifecycle expiry — c
 out as `#` comment lines that `render_ddl.py` skips. It is read-only; review the
 CSV before rendering.
 
+The `table` column comes out prefilled as `cloud_trail_<name>`, with anything
+SQL cannot take in an identifier folded to `_` — the prefix also guarantees a
+leading letter, which a bucket-derived name does not. `--table-prefix` changes
+it. The two staging locations are flags rather than a hand edit per row:
+
+```
+./discover.sh --bucket-filter cloudtrail \
+    --compact-location  s3://my-staging/compact \
+    --accounts-location s3://my-staging/lookups > trails.csv
+```
+
+Both are filled into every row. One `--compact-location` serves all of them
+because each trail's compacted table gets its own `<table>/` subprefix beneath
+it; it must not overlap a trail bucket, and `render_ddl.py` warns if it does.
+Without `--compact-location` the CSV carries a comment saying so, since that is
+the column a large organization cannot do without.
+
 One CSV row per trail; each row produces every variant its columns support —
 `account_id` gets you the single-account table, `org_id` + `accounts` the org
 table, adding `region` the ymd table, adding `compact_location` the compacted

@@ -5,6 +5,13 @@
 #   ./discover.sh --bucket-filter cloudtrail > trails.csv
 #   ./render_ddl.py trails.csv
 #
+# For a large organization, where the org table lists too many prefixes to query,
+# hand it the two staging locations and it fills them into every row:
+#
+#   ./discover.sh --bucket-filter cloudtrail \
+#       --compact-location  s3://my-staging/compact \
+#       --accounts-location s3://my-staging/lookups > trails.csv
+#
 # Two passes, in this order:
 #
 #   1. cloudtrail list-trails / describe-trails -- gives bucket, prefix and the
@@ -28,6 +35,9 @@ MODE="both"          # both | trails | buckets
 MAX_ACCOUNTS=50      # accounts to scan for the region union
 DATE_SAMPLE=3        # accounts to drill for the earliest day
 WITH_YMD=0
+COMPACT_LOCATION=""
+ACCOUNTS_LOCATION=""
+TABLE_PREFIX="cloud_trail_"
 
 usage() {
     cat <<'EOF'
@@ -40,6 +50,17 @@ usage: discover.sh [options] > trails.csv
   --date-sample N       accounts to drill for the earliest day (default 3)
   --with-ymd            also fill the `region` column, which makes render_ddl.py
                         emit the manual year/month/day table as well
+  --compact-location S3URI
+                        s3://bucket/prefix to write compacted Parquet tables to,
+                        filled into every row. Makes render_ddl.py emit the
+                        compacted table and its backfill -- the large-org path.
+                        Each trail gets its own <TABLE>/ subprefix, so one
+                        location serves every row. Must not overlap a trail bucket.
+  --accounts-location S3URI
+                        s3://bucket/prefix holding dump_org_accounts.sh's CSV,
+                        filled into every row. Renders the account -> OU lookup.
+  --table-prefix STR    prefix for the generated `table` column
+                        (default cloud_trail_, giving cloud_trail_<name>)
   --profile NAME        AWS profile
   --region NAME         default region for the API calls
   -h, --help
@@ -56,12 +77,28 @@ while [ $# -gt 0 ]; do
         --max-accounts)  MAX_ACCOUNTS="${2:?}"; shift 2 ;;
         --date-sample)   DATE_SAMPLE="${2:?}"; shift 2 ;;
         --with-ymd)      WITH_YMD=1; shift ;;
+        --compact-location)  COMPACT_LOCATION="${2:?}"; shift 2 ;;
+        --accounts-location) ACCOUNTS_LOCATION="${2:?}"; shift 2 ;;
+        --table-prefix)      TABLE_PREFIX="${2:?}"; shift 2 ;;
         --profile)       export AWS_PROFILE="${2:?}"; shift 2 ;;
         --region)        export AWS_DEFAULT_REGION="${2:?}"; shift 2 ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+# render_ddl.py rejects these anyway, but it does so after a full discovery run.
+for pair in "compact-location:$COMPACT_LOCATION" "accounts-location:$ACCOUNTS_LOCATION"; do
+    case "${pair#*:}" in
+        ""|s3://?*) ;;
+        *) echo "--${pair%%:*} must be an s3:// URI, got '${pair#*:}'" >&2; exit 2 ;;
+    esac
+done
+case "$TABLE_PREFIX" in
+    [A-Za-z_]*) ;;
+    *) echo "--table-prefix must start with a letter or underscore to make a" \
+            "valid SQL identifier, got '$TABLE_PREFIX'" >&2; exit 2 ;;
+esac
 
 warn()    { printf 'warning: %s\n' "$*" >&2; }
 note()    { printf '%s\n' "$*" >&2; }
@@ -109,6 +146,17 @@ uniq_name() {
 
 bucket_seen() { grep -qxF "$1" "$SEEN_BUCKETS" 2>/dev/null; }
 mark_bucket() { printf '%s\n' "$1" >>"$SEEN_BUCKETS"; }
+
+# table_name NAME -- the `table` column for a row: the prefix plus the row name
+# with everything SQL cannot take in an identifier folded to `_`.
+#
+# sanitize() leaves `.` and `-` in the name, and render_ddl.py's variant suffixes
+# (_org, _compact, _ymd) get appended to whatever this returns, so it has to come
+# out a bare identifier on its own. The prefix also guarantees a leading letter,
+# which matters because a bucket-derived name can start with a digit.
+table_name() {
+    printf '%s%s' "$TABLE_PREFIX" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"
+}
 
 # Locate the AWSLogs/ segment: at the bucket root, or under one or two levels of
 # key prefix. Echoes the prefix above it, empty when at the root. Returns 1 when
@@ -272,8 +320,12 @@ emit_row() {
     if [ "$WITH_YMD" = "1" ]; then
         region="$(printf '%s' "$7" | awk '{print $1}')"
     fi
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,,,,\n' \
-        "$1" "$2" "$3" "$4" "$5" "$6" "$region" "$7" "$8"
+    # Columns, in header order. end_date, database and styles stay empty: open-ended
+    # range, render_ddl.py's `cloudtrail` default, and every variant the row supports.
+    #        name bkt pfx acct org accts region regions start |end |db  |table|styles|compact|accounts
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,,,%s,,%s,%s\n' \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$region" "$7" "$8" \
+        "$(table_name "$1")" "$COMPACT_LOCATION" "$ACCOUNTS_LOCATION"
 }
 
 process_bucket() {
@@ -363,9 +415,18 @@ caller="$(aws sts get-caller-identity --query '[Account,Arn]' --output text 2>/d
 [ -n "$caller" ] || { echo "cannot call sts:GetCallerIdentity -- are credentials set?" >&2; exit 1; }
 note "caller: $caller"
 
-echo "name,bucket,prefix,account_id,org_id,accounts,region,regions,start_date,end_date,database,table,styles"
+echo "name,bucket,prefix,account_id,org_id,accounts,region,regions,start_date,end_date,database,table,styles,compact_location,accounts_location"
 comment "generated by discover.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ) as $caller"
 comment "accounts/regions/start_date are read back from the bucket -- what was delivered, not what is configured"
+comment "table is ${TABLE_PREFIX}<name>, non-identifier characters folded to _ (--table-prefix to change)"
+if [ -n "$COMPACT_LOCATION" ]; then
+    comment "compact_location $COMPACT_LOCATION -- renders the compacted table and its backfill"
+else
+    comment "no compact_location: past a couple of hundred accounts the org table lists too many prefixes to query -- see 06_cloudtrail_compact.sql, then re-run with --compact-location"
+fi
+if [ -n "$ACCOUNTS_LOCATION" ]; then
+    comment "accounts_location $ACCOUNTS_LOCATION -- upload dump_org_accounts.sh's CSV there"
+fi
 
 if [ "$MODE" != "buckets" ]; then pass_trails; fi
 if [ "$MODE" != "trails" ];  then pass_buckets; fi
