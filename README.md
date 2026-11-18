@@ -269,7 +269,7 @@ delivery errors, whether data events are logged, SSE-KMS, lifecycle expiry — c
 out as `#` comment lines that `render_ddl.py` skips. It is read-only; review the
 CSV before rendering.
 
-The `table` column comes out prefilled as `cloud_trail_<name>`, with anything
+The `table` column comes out prefilled as `cloudtrail_logs_<name>`, with anything
 SQL cannot take in an identifier folded to `_` — the prefix also guarantees a
 leading letter, which a bucket-derived name does not. `--table-prefix` changes
 it. The two staging locations are flags rather than a hand edit per row:

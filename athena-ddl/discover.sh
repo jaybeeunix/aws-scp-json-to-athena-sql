@@ -37,7 +37,7 @@ DATE_SAMPLE=3        # accounts to drill for the earliest day
 WITH_YMD=0
 COMPACT_LOCATION=""
 ACCOUNTS_LOCATION=""
-TABLE_PREFIX="cloud_trail_"
+TABLE_PREFIX="cloudtrail_logs_"
 
 usage() {
     cat <<'EOF'
@@ -60,7 +60,7 @@ usage: discover.sh [options] > trails.csv
                         s3://bucket/prefix holding dump_org_accounts.sh's CSV,
                         filled into every row. Renders the account -> OU lookup.
   --table-prefix STR    prefix for the generated `table` column
-                        (default cloud_trail_, giving cloud_trail_<name>)
+                        (default cloudtrail_logs_, giving cloudtrail_logs_<name>)
   --profile NAME        AWS profile
   --region NAME         default region for the API calls
   -h, --help
