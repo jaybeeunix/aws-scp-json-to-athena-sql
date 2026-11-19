@@ -204,11 +204,13 @@ min_date() {
 # ---------------------------------------------------------------------------
 
 I_ORG_ID=""; I_ACCOUNT_ID=""; I_ACCOUNTS=""; I_REGIONS=""; I_START=""; I_LAYOUT=""
+I_ACCOUNT_COUNT=0
 
 inspect_bucket() {
     local bucket="$1" prefix="$2" root kids child accounts acct base r day
     local regions="" acct_regions="" n=0
     I_ORG_ID=""; I_ACCOUNT_ID=""; I_ACCOUNTS=""; I_REGIONS=""; I_START=""; I_LAYOUT=""
+    I_ACCOUNT_COUNT=0
 
     root="AWSLogs/"
     [ -n "$prefix" ] && root="$prefix/AWSLogs/"
@@ -228,13 +230,18 @@ inspect_bucket() {
         I_LAYOUT="org"
         accounts="$(s3_children "$bucket" "$root$I_ORG_ID/" | grep -E '^[0-9]{12}$' || true)"
     else
-        I_LAYOUT="single"
         accounts="$(printf '%s\n' "$kids" | grep -E '^[0-9]{12}$' || true)"
         I_ACCOUNT_ID="$(printf '%s\n' "$accounts" | head -1)"
     fi
     if [ -z "$accounts" ]; then
         warn "$bucket: no account-id prefixes under $root$I_ORG_ID"
         return 1
+    fi
+    I_ACCOUNT_COUNT="$(printf '%s\n' "$accounts" | grep -c . || true)"
+    # No org prefix but more than one account id: separate per-account trails sharing
+    # a bucket. Same path shape as the single-account layout, different table.
+    if [ -z "$I_ORG_ID" ]; then
+        if [ "$I_ACCOUNT_COUNT" -gt 1 ]; then I_LAYOUT="multi"; else I_LAYOUT="single"; fi
     fi
     I_ACCOUNTS="$(printf '%s' "$accounts" | tr '\n' ' ' | sed 's/  *$//')"
 
@@ -346,10 +353,16 @@ process_bucket() {
 
     name="$(uniq_name "${name_hint:-$bucket}")"
     acct="$I_ACCOUNT_ID"
-    # The org table keys on the account_id prefixes, not on one owning account.
-    [ "$I_LAYOUT" = "org" ] && acct=""
+    # account_id is what selects the single-account table, whose LOCATION pins one
+    # account id. Leave it set only when the bucket really does hold one account:
+    # for the org layout the account prefixes live under AWSLogs/<org-id>/, and for
+    # several accounts sharing a bucket the multi table covers all of them, where
+    # the single-account one would cover the first and silently omit the rest.
+    if [ "$I_LAYOUT" = "org" ] || [ "$I_ACCOUNT_COUNT" -gt 1 ]; then
+        acct=""
+    fi
 
-    comment "s3://$bucket/${prefix:+$prefix/}AWSLogs/ -- $I_LAYOUT layout${I_ORG_ID:+ ($I_ORG_ID)}"
+    comment "s3://$bucket/${prefix:+$prefix/}AWSLogs/ -- $I_LAYOUT layout${I_ORG_ID:+ ($I_ORG_ID)}, $I_ACCOUNT_COUNT account(s)"
     bucket_notes "$bucket"
     emit_row "$name" "$bucket" "$prefix" "$acct" "$I_ORG_ID" "$I_ACCOUNTS" \
              "$I_REGIONS" "$I_START"
