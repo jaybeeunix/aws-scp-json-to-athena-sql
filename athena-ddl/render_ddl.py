@@ -5,9 +5,11 @@ render_ddl.py -- fill in the CloudTrail Athena DDL templates from a CSV.
 One CSV row describes one trail. For each row the script writes a ready-to-run
 copy of every DDL variant that row has the variables for:
 
-  projection  02_cloudtrail_logs_projection.sql      single-account trail
-  org         03_cloudtrail_logs_org_projection.sql  organization trail
-  ymd         04_cloudtrail_logs_ymd_manual.sql      manual year/month/day partitions
+  projection  02_cloudtrail_logs_projection.sql       single-account trail
+  org         03_cloudtrail_logs_org_projection.sql   organization trail
+  multi       03_cloudtrail_logs_multi_projection.sql several accounts in one bucket
+                                                      with no org prefix
+  ymd         04_cloudtrail_logs_ymd_manual.sql       manual year/month/day partitions
   compact     06_cloudtrail_compact.sql              Parquet copy, partitioned by date
               07_compact_backfill.sql                + the per-day INSERTs that fill it
 
@@ -100,6 +102,11 @@ VARIANTS: Dict[str, Tuple[str, str, str, Tuple[str, ...]]] = {
                    ("account_id",)),
     "org": ("03_cloudtrail_logs_org_projection.sql", "_org", "timestamp",
             ("org_id", "accounts")),
+    # Shares 03's number with `org` on purpose: both are CREATE statements whose only
+    # dependency is 01 and whose only dependents are 05 and 06, so neither has to
+    # sort before the other. multi_accounts is derived -- see the property.
+    "multi": ("03_cloudtrail_logs_multi_projection.sql", "_multi", "timestamp",
+              ("multi_accounts",)),
     "ymd": ("04_cloudtrail_logs_ymd_manual.sql", "_ymd", "ymd",
             ("account_id", "region")),
     # compact_source is derived, not a CSV column: the backfill has to read from
@@ -107,7 +114,7 @@ VARIANTS: Dict[str, Tuple[str, str, str, Tuple[str, ...]]] = {
     "compact": ("06_cloudtrail_compact.sql", "_compact", "iso",
                 ("compact_location", "compact_source")),
 }
-VARIANT_ORDER = ("projection", "org", "ymd", "compact")
+VARIANT_ORDER = ("projection", "org", "multi", "ymd", "compact")
 
 # Rendered files are run in filename order -- `run_sql.py rendered/<name>/*.sql`
 # globs them -- so the leading number IS the dependency order, and a file that
@@ -118,7 +125,7 @@ VARIANT_ORDER = ("projection", "org", "ymd", "compact")
 # validating an empty table tells you nothing, so its checks have to land after
 # both. Hence 09 rather than another 05.
 VALIDATE_PREFIX: Dict[str, str] = {
-    "projection": "05", "org": "05", "ymd": "05", "compact": "09",
+    "projection": "05", "org": "05", "multi": "05", "ymd": "05", "compact": "09",
 }
 
 # Column order of 06_cloudtrail_compact.sql, which 07's INSERT ... SELECT must match
@@ -328,13 +335,27 @@ class Trail:
         return self.accounts_bucket
 
     @property
+    def multi_accounts(self) -> str:
+        """Several accounts delivering into one bucket with no org prefix -- N
+        account-level trails sharing a destination.
+
+        Empty when there is an org id, because AWSLogs/<org>/ is a different path
+        and 03's org table already covers it, and empty for a single account,
+        because 02 covers that with one less partition key to enumerate. Only the
+        in-between case needs its own table, and it is the case that was silently
+        rendering as 02 against whichever account happened to sort first.
+        """
+        if self.org_id or len(self.accounts) < 2:
+            return ""
+        return " ".join(self.accounts)
+
+    @property
     def compact_source(self) -> str:
-        """Variant the backfill reads from. The org table if there is one, because
-        that is the case compaction exists for; otherwise the single-account table."""
-        if not self.missing_for("org"):
-            return "org"
-        if not self.missing_for("projection"):
-            return "projection"
+        """Variant the backfill reads from, widest first: whichever of these tables
+        exists covers a superset of the next one's accounts."""
+        for variant in ("org", "multi", "projection"):
+            if not self.missing_for(variant):
+                return variant
         return ""
 
     def missing_for(self, variant: str) -> List[str]:
@@ -380,6 +401,16 @@ class Trail:
         if days > LONG_WINDOW_DAYS:
             out.append("window is %d days (%s..%s); the ymd variant would register "
                        "that many partitions" % (days, self.start, self.end_concrete))
+
+        if self.multi_accounts and self.account_id:
+            # 02's LOCATION hardcodes one account id, so against a bucket holding
+            # several it covers one and reports nothing for the rest -- and "no rows"
+            # in an impact report reads as "this SCP blocks nothing".
+            out.append("account_id %s is set but the bucket holds %d accounts; the "
+                       "single-account table covers only that one. The multi table "
+                       "covers all %d -- clear account_id unless you specifically "
+                       "want the narrow one (or the ymd table, which needs it)"
+                       % (self.account_id, len(self.accounts), len(self.accounts)))
 
         if len(self.accounts) > ACCOUNTS_NEEDING_COMPACTION and not self.compact_bucket:
             out.append(
@@ -558,9 +589,9 @@ def suggested_command(trail: Trail, variant: str, table: str) -> List[str]:
     if trail.accounts_bucket:
         lines.append("    --accounts-table %s.%s \\"
                      % (trail.database, trail.accounts_table))
-    many_accounts = (variant in ("org", "compact")
-                     and len(trail.accounts) > MAX_SUGGESTED_ACCOUNTS)
-    if variant in ("org", "compact") and trail.accounts and not many_accounts:
+    scoped_by_table = variant in ("org", "multi", "compact")
+    many_accounts = scoped_by_table and len(trail.accounts) > MAX_SUGGESTED_ACCOUNTS
+    if scoped_by_table and trail.accounts and not many_accounts:
         lines.append("    --accounts %s \\" % wrap_accounts(trail.accounts, "        "))
     lines.append("    --out-dir athena-queries")
     if many_accounts:
