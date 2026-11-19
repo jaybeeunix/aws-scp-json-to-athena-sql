@@ -11,11 +11,14 @@ copy of every DDL variant that row has the variables for:
   compact     06_cloudtrail_compact.sql              Parquet copy, partitioned by date
               07_compact_backfill.sql                + the per-day INSERTs that fill it
 
-plus 01_create_database.sql once per row, and a 05_validate_<variant>.sql whose
-partition filters match that variant's partitioning. The ymd variant also gets
-its ALTER TABLE ... ADD PARTITION statements generated for the whole window,
-batched so the console can run them. Setting `accounts_location` additionally
-renders 08_org_accounts.sql, the OU lookup table.
+plus 01_create_database.sql once per row, and a validation file whose partition
+filters match that variant's partitioning -- 05_validate_<variant>.sql for the
+first three, 09_validate_compact.sql for the last, because the rendered files
+are run in filename order and the compacted table is not readable until 07 has
+filled it. The ymd variant also gets its ALTER TABLE ... ADD PARTITION
+statements generated for the whole window, batched so the console can run them.
+Setting `accounts_location` additionally renders 08_org_accounts.sql, the OU
+lookup table.
 
 `compact` is the one to use on a large organization. Projection over an org
 trail costs accounts x regions x days prefix listings per query, which stops
@@ -105,6 +108,18 @@ VARIANTS: Dict[str, Tuple[str, str, str, Tuple[str, ...]]] = {
                 ("compact_location", "compact_source")),
 }
 VARIANT_ORDER = ("projection", "org", "ymd", "compact")
+
+# Rendered files are run in filename order -- `run_sql.py rendered/<name>/*.sql`
+# globs them -- so the leading number IS the dependency order, and a file that
+# sorts before what it depends on is a broken render, not an untidy one.
+#
+# The projection/org/ymd tables are all created by 02-04, so 05 validates them.
+# The compacted table is not comparable: 06 creates it but 07 fills it, and
+# validating an empty table tells you nothing, so its checks have to land after
+# both. Hence 09 rather than another 05.
+VALIDATE_PREFIX: Dict[str, str] = {
+    "projection": "05", "org": "05", "ymd": "05", "compact": "09",
+}
 
 # Column order of 06_cloudtrail_compact.sql, which 07's INSERT ... SELECT must match
 # exactly -- INSERT INTO binds by position, so a mismatch shifts data silently instead
@@ -709,7 +724,7 @@ def render_trail(trail: Trail, template_dir: str, generated: str,
                     header(trail, template_name, generated, variant, table)
                     + render(load_template(template_dir, template_name), mapping,
                              "%s/%s" % (trail.name, template_name))))
-        validate_name = "05_validate_%s.sql" % variant
+        validate_name = "%s_validate_%s.sql" % (VALIDATE_PREFIX[variant], variant)
         out.append((validate_name,
                     header(trail, VALIDATE_TEMPLATE, generated)
                     + render(validate_template, mapping,
@@ -843,6 +858,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             variants = sorted({n for n, _ in files})
             sys.stderr.write("%s -> %s (%s)\n"
                              % (trail.name, directory, ", ".join(variants)))
+            # run_sql.py takes the directory as a glob, so anything left over from
+            # an earlier render -- a dropped variant, a renamed file -- still gets
+            # executed, in whatever position its name sorts to.
+            stale = sorted(set(os.listdir(directory))
+                           - {n for n, _ in files}
+                           - {n for n in os.listdir(directory)
+                              if not n.endswith(".sql")})
+            for name in stale:
+                sys.stderr.write(
+                    "warning: %s: %s is left over from an earlier render and was "
+                    "not regenerated; delete it, or `run_sql.py <dir>/*.sql` will "
+                    "still run it\n" % (trail.name, name))
     sys.stderr.write("%d file(s) written\n" % written)
     return 0
 

@@ -163,9 +163,20 @@ aws s3 cp org_accounts.csv s3://my-staging/lookups/org_accounts/
 
 # add compact_location + accounts_location to the CSV row, then
 ./render_ddl.py trails.csv --force
-./run_sql.py --work-group scp-impact rendered/prod-org/0[1368]*.sql
-./run_sql.py --work-group scp-impact --jobs 8 rendered/prod-org/07_compact_backfill.sql
+
+D=rendered/prod-org
+./run_sql.py --work-group scp-impact $D/0[1-6]*.sql $D/08_*.sql  # create the tables
+./run_sql.py --work-group scp-impact --jobs 8 $D/07_compact_backfill.sql
+./run_sql.py --work-group scp-impact $D/09_validate_compact.sql  # after the backfill
 ```
+
+The leading numbers are the dependency order — `run_sql.py <dir>/*.sql` runs
+them in filename order, and the whole directory in one go is right for every
+variant except the compacted one. That one is split because the backfill wants
+`--jobs`, and because its validation has to come after the data lands rather
+than after the table exists, which is why it is `09` and not another `05`.
+`render_ddl.py` warns about files left over from an earlier render, since the
+glob would still pick those up.
 
 `07_compact_backfill.sql` is one `INSERT INTO` per day, and that is the whole
 trick: pinning `timestamp` to a single day divides the listing by the length of
@@ -289,8 +300,9 @@ the column a large organization cannot do without.
 One CSV row per trail; each row produces every variant its columns support —
 `account_id` gets you the single-account table, `org_id` + `accounts` the org
 table, adding `region` the ymd table, adding `compact_location` the compacted
-table and its backfill — plus a `05_validate_<variant>.sql` whose partition
-filters match that variant. `accounts_location` additionally renders the OU
+table and its backfill — plus a validation file whose partition filters match
+that variant (`05_validate_<variant>.sql`, or `09_validate_compact.sql` for the
+compacted one, which is not readable until `07` has filled it). `accounts_location` additionally renders the OU
 lookup table. Past 200 accounts without a `compact_location` set, the renderer
 warns with the prefix count the org table would make Athena list. The ymd variant's `ADD PARTITION`
 statements are generated for the whole window and batched. Each rendered file
@@ -325,7 +337,7 @@ correct even if the partition style is wrong; only the bytes scanned suffer.
 ## Running the SQL
 
 `StartQueryExecution` takes one statement, and these files hold several — `04`
-is a `CREATE` plus batched `ALTER`s, `05_validate_*` is five `SELECT`s, and each
+is a `CREATE` plus batched `ALTER`s, `*_validate_*` is five `SELECT`s, and each
 generated query file is a SUMMARY plus a DETAIL. `run_sql.py` splits a file
 (quote- and comment-aware, so a `;` in a string or comment does not end a
 statement), submits each in order, waits, and prints state, bytes scanned and
