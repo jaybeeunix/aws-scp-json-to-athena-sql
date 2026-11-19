@@ -441,7 +441,45 @@ class Compact(unittest.TestCase):
         names = [n for n, _ in rd.render_trail(compact_trail(), rd.HERE, "d",
                                                ["compact"])]
         self.assertIn(rd.BACKFILL_TEMPLATE, names)
-        self.assertIn("05_validate_compact.sql", names)
+        self.assertIn("09_validate_compact.sql", names)
+
+    def test_compact_validation_sorts_after_the_backfill(self):
+        """run_sql.py globs the directory, so filename order is the dependency
+        order. At 05 the compact checks ran before 06 created the table -- and
+        even after 06 they would have been checking an empty table, because 07
+        is what fills it."""
+        names = sorted(n for n, _ in rd.render_trail(compact_trail(), rd.HERE,
+                                                     "d", None))
+        order = {name: i for i, name in enumerate(names)}
+        create = order[rd.VARIANTS["compact"][0]]
+        backfill = order[rd.BACKFILL_TEMPLATE]
+        validate = order["09_validate_compact.sql"]
+        self.assertLess(create, backfill)
+        self.assertLess(backfill, validate)
+
+    def test_every_rendered_file_sorts_after_what_it_reads(self):
+        """A general guard on the numbering: no file may create or query a table
+        earlier in the glob than the file that creates it."""
+        trail_ = trail(account_id="1" * 12, org_id="o-abc1234567",
+                       accounts="2" * 12, region="us-east-1",
+                       end_date="2025-06-03",
+                       compact_location="s3://staging/compact",
+                       accounts_location="s3://staging/lookups")
+        files = sorted(rd.render_trail(trail_, rd.HERE, "d", None))
+        created = set()
+        for name, sql in files:
+            body = "\n".join(line for line in sql.split("\n")
+                             if not line.lstrip().startswith("--"))
+            for referenced in set(re.findall(r"\bcloudtrail\.[a-z0-9_]+", body)):
+                if referenced not in created:
+                    self.assertRegex(
+                        body,
+                        r"CREATE (EXTERNAL )?TABLE IF NOT EXISTS %s\b" % referenced,
+                        "%s reads %s before any earlier file creates it"
+                        % (name, referenced))
+            created.update(re.findall(
+                r"CREATE (?:EXTERNAL )?TABLE IF NOT EXISTS (cloudtrail\.[a-z0-9_]+)",
+                body))
 
 
 class OrgAccounts(unittest.TestCase):

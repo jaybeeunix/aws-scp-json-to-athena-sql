@@ -3,7 +3,7 @@
 run_sql.py -- run a .sql file through Athena with the aws CLI.
 
 Athena's StartQueryExecution takes one statement, but these files hold several:
-04_*.sql is a CREATE plus batched ALTER ... ADD PARTITION, 05_validate_*.sql is
+04_*.sql is a CREATE plus batched ALTER ... ADD PARTITION, *_validate_*.sql is
 five SELECTs, and the queries scp_to_athena.py writes are a SUMMARY plus a
 DETAIL. This splits a file into statements -- quote- and comment-aware, so a
 `;` inside a string or a `--` comment does not end one -- then submits each in
