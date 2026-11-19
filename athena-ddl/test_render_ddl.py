@@ -482,6 +482,72 @@ class Compact(unittest.TestCase):
                 body))
 
 
+class MultiAccount(unittest.TestCase):
+    def test_two_or_more_accounts_without_an_org_id(self):
+        self.assertTrue(trail(accounts="1" * 12 + " " + "2" * 12).multi_accounts)
+
+    def test_one_account_is_the_single_account_table(self):
+        self.assertFalse(trail(accounts="1" * 12).multi_accounts)
+        self.assertEqual(trail(accounts="1" * 12).missing_for("multi"),
+                         ["multi_accounts"])
+
+    def test_an_org_id_takes_precedence(self):
+        """AWSLogs/<org>/<account>/ is a different path, and 03's org table already
+        covers it -- rendering both would be two tables over the same data."""
+        t = trail(org_id="o-abc1234567", accounts="1" * 12 + " " + "2" * 12)
+        self.assertFalse(t.multi_accounts)
+        self.assertEqual(t.variants(), ["org"])
+
+    def test_variant_selected_for_a_shared_bucket(self):
+        t = trail(accounts="1" * 12 + " " + "2" * 12)
+        self.assertEqual(t.variants(), ["multi"])
+
+    def test_location_is_the_awslogs_root_with_account_projected(self):
+        """02 hardcodes one account id in its LOCATION; that is the bug this
+        variant exists for, so the path must stop at AWSLogs/."""
+        t = trail(bucket="shared-bucket", accounts=" ".join(["1" * 12, "2" * 12]))
+        files = dict(rd.render_trail(t, rd.HERE, "d", ["multi"]))
+        sql = files[rd.VARIANTS["multi"][0]]
+        self.assertIn("LOCATION 's3://shared-bucket/AWSLogs/'", sql)
+        self.assertIn("AWSLogs/${account_id}/CloudTrail/${region}/${timestamp}", sql)
+        self.assertIn("'projection.account_id.values'       = "
+                      "'111111111111,222222222222'", sql)
+        # No account id may appear in the LOCATION itself.
+        location = [l for l in sql.split("\n") if l.startswith("LOCATION ")][0]
+        self.assertNotRegex(location, r"\d{12}")
+
+    def test_prefix_is_honoured(self):
+        t = trail(bucket="shared-bucket", prefix="logs/x",
+                  accounts=" ".join(["1" * 12, "2" * 12]))
+        files = dict(rd.render_trail(t, rd.HERE, "d", ["multi"]))
+        self.assertIn("LOCATION 's3://shared-bucket/logs/x/AWSLogs/'",
+                      files[rd.VARIANTS["multi"][0]])
+
+    def test_columns_match_the_org_table(self):
+        """The two templates duplicate the column block. They have to stay
+        identical or a query written against one breaks against the other."""
+        def columns(name):
+            text = rd.load_template(rd.HERE, name)
+            body = text.split("CREATE EXTERNAL TABLE", 1)[1].split("PARTITIONED BY", 1)[0]
+            return [line.strip().split()[0] for line in body.split("\n")
+                    if re.match(r"^\s{4}[a-z_]+\s+(STRING|STRUCT|ARRAY)", line)]
+        self.assertEqual(columns(rd.VARIANTS["multi"][0]),
+                         columns(rd.VARIANTS["org"][0]))
+
+    def test_pinned_account_id_is_flagged(self):
+        warnings = trail(account_id="1" * 12,
+                         accounts=" ".join(["1" * 12, "2" * 12])).warnings()
+        self.assertTrue(any("covers only that one" in w for w in warnings), warnings)
+
+    def test_compaction_reads_the_multi_table(self):
+        t = trail(accounts=" ".join(["1" * 12, "2" * 12]),
+                  compact_location="s3://staging/compact", end_date="2025-06-02")
+        self.assertEqual(t.compact_source, "multi")
+        files = dict(rd.render_trail(t, rd.HERE, "d", None))
+        self.assertIn("FROM cloudtrail.cloudtrail_logs_multi",
+                      files[rd.BACKFILL_TEMPLATE])
+
+
 class OrgAccounts(unittest.TestCase):
     def test_rendered_only_when_a_location_is_given(self):
         names = [n for n, _ in rd.render_trail(trail(account_id="1" * 12),

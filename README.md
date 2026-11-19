@@ -136,9 +136,10 @@ results as candidates to review, not confirmed breakage.
 
 An org trail's S3 layout is
 `AWSLogs/<org>/<account>/CloudTrail/<region>/<yyyy>/<MM>/<dd>/`, so the Athena
-table partitions on account × region × day. Partition projection resolves those
-at query time by *listing every combination the filters do not rule out*, and
-the generated queries only filter on the day:
+table partitions on account × region × day. The multi-account table has the same
+three partition keys and the same problem, so everything here applies to it too.
+Partition projection resolves those at query time by *listing every combination
+the filters do not rule out*, and the generated queries only filter on the day:
 
 ```
    50 accounts × 34 regions × 123 days =     209,100 prefixes   fine
@@ -250,6 +251,7 @@ such a table, `athena-ddl/` has the DDL as templates:
 | `01_create_database.sql` | the `cloudtrail` Glue database |
 | `02_cloudtrail_logs_projection.sql` | single-account trail, all regions, partition projection |
 | `03_cloudtrail_logs_org_projection.sql` | **organization trail** — the one to use for SCP analysis |
+| `03_cloudtrail_logs_multi_projection.sql` | several accounts delivering into one bucket with no org prefix |
 | `04_cloudtrail_logs_ymd_manual.sql` | manual `year`/`month`/`day` partitions, for `--partition-style ymd` |
 | `05_validate.sql` | smoke tests — run these before trusting the generated queries |
 | `06_cloudtrail_compact.sql` | **Parquet copy partitioned by date alone** — see [Large organizations](#large-organizations) |
@@ -297,8 +299,25 @@ it; it must not overlap a trail bucket, and `render_ddl.py` warns if it does.
 Without `--compact-location` the CSV carries a comment saying so, since that is
 the column a large organization cannot do without.
 
+Three S3 layouts, three tables, and the middle one is easy to miss:
+
+| Layout | Table |
+| --- | --- |
+| `AWSLogs/<org-id>/<account>/CloudTrail/<region>/…` | `03_…_org_projection` |
+| `AWSLogs/<account>/CloudTrail/<region>/…`, several account prefixes | `03_…_multi_projection` |
+| `AWSLogs/<account>/CloudTrail/<region>/…`, one account prefix | `02_…_projection` |
+
+The last two are the same path shape — the only difference is how many account
+prefixes the bucket holds — which is why the multi table exists. `02` hardcodes
+one account id in its `LOCATION`, so pointed at a bucket holding thirteen it
+covers one and returns nothing for the other twelve. In an impact report "no
+rows" reads as "this SCP blocks nothing", so the undercount does not look like
+an error. `discover.sh` leaves `account_id` empty when it finds more than one
+account prefix, and `render_ddl.py` warns if a CSV sets it anyway.
+
 One CSV row per trail; each row produces every variant its columns support —
-`account_id` gets you the single-account table, `org_id` + `accounts` the org
+`account_id` gets you the single-account table, two or more `accounts` with no
+`org_id` the multi table, `org_id` + `accounts` the org
 table, adding `region` the ymd table, adding `compact_location` the compacted
 table and its backfill — plus a validation file whose partition filters match
 that variant (`05_validate_<variant>.sql`, or `09_validate_compact.sql` for the
